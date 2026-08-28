@@ -238,7 +238,7 @@ export interface Bot {
   /** Whether this bot may use the workspace's connected apps. Unset means
    * allowed for existing bots; imported bots start with this disabled. */
   composio?: boolean;
-  /** Whether this bot gets the app's built-in browser (Browser tab). Off by default. */
+  /** Whether this bot gets the app's built-in browser (Browser tab). On unless switched off. */
   browser?: boolean;
   messages: Message[];
   /** leaf of the visible conversation branch (see visibleMessages) */
@@ -290,7 +290,7 @@ export interface ConfigStatus {
   /** who's using the app — collected in onboarding, shown in the sidebar */
   profile?: { name: string; email: string };
   /** Opt-in flags. Absent means off. */
-  features?: { skillRecorder: boolean; showToolCalls?: boolean };
+  features?: { skillRecorder: boolean; showToolCalls?: boolean; browser?: boolean };
 }
 
 export type ConfigStatusFrame = Pick<

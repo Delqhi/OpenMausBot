@@ -62,6 +62,7 @@ import {
   saveConfig,
   showToolCallsEnabled,
   skillRecorderEnabled,
+  builtInBrowserEnabled,
   syncCredentialEnv,
   withInstanceCli,
   vpsSshAlias,
@@ -1822,7 +1823,7 @@ async function startTurn(
       }
       // the built-in browser: per-bot opt-in, and only to a driver that can
       // mount it, and only while the desktop app is running its host
-      const browser = bot.browser === true && instance.adapter.capabilities.browserMcp === true
+      const browser = builtInBrowserEnabled(cfg) && bot.browser !== false && instance.adapter.capabilities.browserMcp === true
         ? browserIntegration(bot.id)
         : null;
       if (browser) integrations.browser = browser.integration;
@@ -2472,7 +2473,7 @@ async function runGroupMemberTurn(
   if (selectedSkills.some((skill) => skill.manifest.requiredCapabilities.includes("phoneMcp"))) {
     integrations.phone = phoneIntegration();
   }
-  if (bot.browser === true && instance.adapter.capabilities.browserMcp === true) {
+  if (builtInBrowserEnabled(cfg) && bot.browser !== false && instance.adapter.capabilities.browserMcp === true) {
     const browser = browserIntegration(bot.id);
     if (browser) integrations.browser = browser.integration;
   }
@@ -3140,7 +3141,11 @@ function configStatus() {
       mode: localVmMode(cfg),
       maxInstances: localVmMaxInstances(cfg),
     },
-    features: { skillRecorder: skillRecorderEnabled(cfg), showToolCalls: showToolCallsEnabled(cfg) },
+    features: {
+      skillRecorder: skillRecorderEnabled(cfg),
+      showToolCalls: showToolCallsEnabled(cfg),
+      browser: builtInBrowserEnabled(cfg),
+    },
   };
 }
 

@@ -15,6 +15,7 @@ import {
   roomTurnTimeoutMinutes,
   showToolCallsEnabled,
   skillRecorderEnabled,
+  builtInBrowserEnabled,
   stripWorkspaceCredentialEnv,
   syncCredentialEnv,
   vpsSshAlias,
@@ -87,6 +88,12 @@ describe("configuration boundaries", () => {
       features: { skillRecorder: true },
     });
     expect(skillRecorderEnabled({ features: { skillRecorder: true } })).toBe(true);
+    // the built-in browser is on unless switched off — an independent flag
+    expect(builtInBrowserEnabled({})).toBe(true);
+    expect(builtInBrowserEnabled({ features: { skillRecorder: true } })).toBe(true);
+    expect(parseConfigPatch({ features: { browser: false } })).toEqual({ features: { browser: false } });
+    expect(builtInBrowserEnabled({ features: { browser: false } })).toBe(false);
+    expect(builtInBrowserEnabled({ features: { browser: true } })).toBe(true);
     expect(() => parseConfigPatch({ features: { skillRecorder: "yes" } })).toThrow(
       "features.skillRecorder",
     );

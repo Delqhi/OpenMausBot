@@ -6,7 +6,7 @@ import { useEffect, useRef, useState } from "react";
 import { Coins, KeyRound, Monitor, Search, Smartphone, Terminal, User, X } from "lucide-react";
 import { api, useStore, type AppSettingsSection, type ConfigStatus } from "@/state/store";
 import { analyticsEnabled, setAnalyticsEnabled } from "@/lib/analytics";
-import { showToolCallsEnabled, skillRecorderEnabled } from "@/lib/feature-flags";
+import { builtInBrowserEnabled, showToolCallsEnabled, skillRecorderEnabled } from "@/lib/feature-flags";
 import { ApiKeyRow, VpsConnection } from "./ApiKeys";
 import { useUpdaterState } from "@/lib/updater";
 import { EnginesSettings } from "./EnginesSettings";
@@ -194,24 +194,26 @@ function ToolCallsRow() {
 
 function ExperimentalFeaturesRow() {
   const { state, dispatch } = useStore();
-  const enabled = skillRecorderEnabled(state.config);
-  const [saving, setSaving] = useState(false);
+  const skillRecorder = skillRecorderEnabled(state.config);
+  const browser = builtInBrowserEnabled(state.config);
+  const desktopBrowser = Boolean(window.ogb?.browser);
+  const [saving, setSaving] = useState<"skillRecorder" | "browser" | null>(null);
   const [error, setError] = useState("");
 
-  const toggle = async () => {
+  const toggle = async (feature: "skillRecorder" | "browser", next: boolean) => {
     if (saving) return;
-    setSaving(true);
+    setSaving(feature);
     setError("");
     try {
       const config: ConfigStatus = await api("/api/config", {
         method: "PATCH",
-        body: JSON.stringify({ features: { skillRecorder: !enabled } }),
+        body: JSON.stringify({ features: { [feature]: next } }),
       });
       dispatch({ type: "configStatus", config });
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : "Could not save the experimental feature setting.");
     } finally {
-      setSaving(false);
+      setSaving(null);
     }
   };
 
@@ -229,13 +231,33 @@ function ExperimentalFeaturesRow() {
         </div>
         <button
           role="switch"
-          aria-checked={enabled}
+          aria-checked={skillRecorder}
           aria-label="Show Teach a skill"
-          disabled={saving}
-          onClick={() => void toggle()}
-          className={`${cnSwitch(enabled)} disabled:cursor-wait disabled:opacity-50`}
+          disabled={saving !== null}
+          onClick={() => void toggle("skillRecorder", !skillRecorder)}
+          className={`${cnSwitch(skillRecorder)} disabled:cursor-wait disabled:opacity-50`}
         >
-          <span className={cnKnob(enabled)} />
+          <span className={cnKnob(skillRecorder)} />
+        </button>
+      </div>
+      <div className="mt-4 flex items-center justify-between gap-4 border-t border-hairline/30 pt-4">
+        <div className="min-w-0">
+          <div className="text-[14px] font-medium text-ink">Built-in browser</div>
+          <div className="mt-0.5 text-[12px] leading-relaxed text-ink-secondary">
+            {desktopBrowser
+              ? "Bots get their own browser tab in the computer panel. Turn this off to remove it for every bot; each bot also has its own switch."
+              : "Needs the OpenMausBot desktop app."}
+          </div>
+        </div>
+        <button
+          role="switch"
+          aria-checked={browser}
+          aria-label="Enable the built-in browser"
+          disabled={saving !== null || (!browser && !desktopBrowser)}
+          onClick={() => void toggle("browser", !browser)}
+          className={`${cnSwitch(browser)} disabled:cursor-wait disabled:opacity-50`}
+        >
+          <span className={cnKnob(browser)} />
         </button>
       </div>
       {error ? <p role="alert" className="mt-2 text-[12px] text-danger">{error}</p> : null}
