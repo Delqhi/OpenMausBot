@@ -20,6 +20,7 @@ const {
   browserNavigationAllowed,
   browserNavigationUrl,
   browserPartition,
+  browserProfilePartition,
   browserUserAgent,
   formatSnapshot,
   snapshotFromAxNodes,
@@ -77,7 +78,7 @@ function createBrowserSurfaceManager({
   createView,
   notify,
   platform = process.platform,
-  partitionFor = browserPartition,
+  partitionFor: partitionFor0 = browserPartition,
   settleMs = SETTLE_MS,
 }) {
   if (!owner || owner.isDestroyed?.()) throw new Error("The OpenMausBot window is unavailable");
@@ -96,6 +97,7 @@ function createBrowserSurfaceManager({
       loading: destroyed ? false : contents.isLoading?.() === true,
       canGoBack: destroyed ? false : contents.navigationHistory?.canGoBack?.() ?? contents.canGoBack?.() ?? false,
       visible: entry.visible,
+      partition: entry.partition,
     };
   };
 
@@ -152,12 +154,26 @@ function createBrowserSurfaceManager({
     emit({ botId: entry.botId, open: false, url: "", title: "", loading: false, canGoBack: false, visible: false, ...(code ? { code } : {}) });
   };
 
-  const ensure = (rawBotId) => {
+  /** The partition a bot's tab should live in: a named profile when one is
+   * chosen (shared across bots), otherwise the bot's own. `undefined` means
+   * "whatever it already is" — callers that don't know the profile never
+   * evict a tab. */
+  const partitionFor = (botId, profile) =>
+    profile ? browserProfilePartition(profile) : partitionFor_(botId);
+  const partitionFor_ = partitionFor0;
+
+  const ensure = (rawBotId, profile) => {
     const botId = botIdOf(rawBotId);
     const existing = entries.get(botId);
-    if (existing) return existing;
+    if (existing) {
+      if (profile === undefined || existing.partition === partitionFor(botId, profile)) return existing;
+      // A different profile is a different session: the old tab goes, its
+      // page with it. The person chose the switch, so this is expected.
+      remove(existing, "profile-changed");
+    }
     if (entries.size >= MAX_VIEWS) throw new Error(`Only ${MAX_VIEWS} bot browsers can be open at once`);
     if (owner.isDestroyed?.()) throw new Error("The OpenMausBot window is unavailable");
+    const partition = partitionFor(botId, profile);
     const view = createView({
       webPreferences: {
         nodeIntegration: false,
@@ -165,10 +181,10 @@ function createBrowserSurfaceManager({
         sandbox: true,
         webSecurity: true,
         allowRunningInsecureContent: false,
-        partition: partitionFor(botId),
+        partition,
       },
     });
-    const entry = { botId, view, attached: false, visible: false, bounds: null };
+    const entry = { botId, view, attached: false, visible: false, bounds: null, partition };
     entries.set(botId, entry);
     secure(entry);
     view.setVisible(false);
@@ -248,9 +264,10 @@ function createBrowserSurfaceManager({
   const selectAllModifiers = platform === "darwin" ? 4 : 2;
 
   const api = {
-    /** Create the bot's view (hidden) if it does not exist yet. */
-    ensure(botId) {
-      return stateFor(ensure(botId));
+    /** Create the bot's view (hidden) if it does not exist yet, or move it
+     * to another profile's session. */
+    ensure(botId, profile) {
+      return stateFor(ensure(botId, profile));
     },
 
     state(botId) {
@@ -259,7 +276,7 @@ function createBrowserSurfaceManager({
     },
 
     /** Position the view over the renderer's rectangle, or hide it (null). */
-    layout(botId, bounds) {
+    layout(botId, bounds, profile) {
       if (bounds === null || bounds === undefined) {
         const entry = entries.get(botIdOf(botId));
         if (!entry) return api.state(botId);
@@ -267,7 +284,7 @@ function createBrowserSurfaceManager({
         entry.view.setVisible(false);
         return stateFor(entry);
       }
-      const entry = ensure(botId);
+      const entry = ensure(botId, profile);
       const normalized = normalizeDesktopWorkspaceBounds(bounds, owner.getContentSize());
       entry.bounds = normalized;
       entry.view.setBounds(normalized);
@@ -276,8 +293,8 @@ function createBrowserSurfaceManager({
       return stateFor(entry);
     },
 
-    async navigate(botId, rawUrl) {
-      const entry = ensure(botId);
+    async navigate(botId, rawUrl, profile) {
+      const entry = ensure(botId, profile);
       const url = browserNavigationUrl(rawUrl);
       try {
         await entry.view.webContents.loadURL(url);
@@ -290,8 +307,8 @@ function createBrowserSurfaceManager({
       return observe(entry);
     },
 
-    async back(botId) {
-      const entry = ensure(botId);
+    async back(botId, profile) {
+      const entry = ensure(botId, profile);
       const contents = entry.view.webContents;
       const canGoBack = contents.navigationHistory?.canGoBack?.() ?? contents.canGoBack?.();
       if (!canGoBack) throw new Error("there is no previous page");
@@ -300,14 +317,14 @@ function createBrowserSurfaceManager({
       return observe(entry);
     },
 
-    async snapshot(botId) {
-      const entry = ensure(botId);
+    async snapshot(botId, profile) {
+      const entry = ensure(botId, profile);
       await settle(entry, 0);
       return snapshot(entry);
     },
 
-    async click(botId, ref, { button = "left", clickCount = 1 } = {}) {
-      const entry = ensure(botId);
+    async click(botId, ref, { button = "left", clickCount = 1 } = {}, profile) {
+      const entry = ensure(botId, profile);
       const { x, y } = await centerOf(entry, ref);
       const which = button === "right" ? "right" : button === "middle" ? "middle" : "left";
       await cdp(entry, "Input.dispatchMouseEvent", { type: "mouseMoved", x, y });
@@ -316,8 +333,8 @@ function createBrowserSurfaceManager({
       return observe(entry);
     },
 
-    async fill(botId, ref, text) {
-      const entry = ensure(botId);
+    async fill(botId, ref, text, profile) {
+      const entry = ensure(botId, profile);
       const value = String(text ?? "");
       if (value.length > MAX_TEXT) throw new Error(`text is limited to ${MAX_TEXT} characters`);
       const { backendNodeId } = await centerOf(entry, ref);
@@ -330,8 +347,8 @@ function createBrowserSurfaceManager({
       return observe(entry);
     },
 
-    async type(botId, text) {
-      const entry = ensure(botId);
+    async type(botId, text, profile) {
+      const entry = ensure(botId, profile);
       const value = String(text ?? "");
       if (!value) throw new Error("text is required");
       if (value.length > MAX_TEXT) throw new Error(`text is limited to ${MAX_TEXT} characters`);
@@ -339,8 +356,8 @@ function createBrowserSurfaceManager({
       return observe(entry);
     },
 
-    async press(botId, rawKey) {
-      const entry = ensure(botId);
+    async press(botId, rawKey, profile) {
+      const entry = ensure(botId, profile);
       const key = KEYS[String(rawKey ?? "").toLowerCase().replace(/[\s_-]/g, "")];
       if (!key) throw new Error(`unsupported key; use one of ${Object.keys(KEYS).join(", ")}`);
       await cdp(entry, "Input.dispatchKeyEvent", { type: key.text ? "keyDown" : "rawKeyDown", ...key });
@@ -348,8 +365,8 @@ function createBrowserSurfaceManager({
       return observe(entry);
     },
 
-    async scroll(botId, rawDirection, amount) {
-      const entry = ensure(botId);
+    async scroll(botId, rawDirection, amount, profile) {
+      const entry = ensure(botId, profile);
       const direction = SCROLL_DIRECTIONS[String(rawDirection ?? "down").toLowerCase()];
       if (!direction) throw new Error("direction must be up, down, left, or right");
       const pixels = Number.isFinite(Number(amount)) && Number(amount) > 0 ? Math.min(Number(amount), 5_000) : 600;
@@ -359,8 +376,8 @@ function createBrowserSurfaceManager({
     },
 
     /** JPEG of the page, downscaled for the model; the panel shows the real view. */
-    async screenshot(botId) {
-      const entry = ensure(botId);
+    async screenshot(botId, profile) {
+      const entry = ensure(botId, profile);
       const image = await entry.view.webContents.capturePage();
       const size = image.getSize();
       const scaled = size.width > SCREENSHOT_WIDTH ? image.resize({ width: SCREENSHOT_WIDTH }) : image;

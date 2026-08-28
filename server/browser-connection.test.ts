@@ -73,11 +73,13 @@ describe("browser connection descriptor", () => {
         headers: { "content-type": "application/json" },
       });
     }) as typeof fetch;
-    await expect(browserScreenshot({ url: "http://127.0.0.1:52144", token: TOKEN }, "bot 1", fetchImpl)).resolves.toEqual({
+    await expect(browserScreenshot({ url: "http://127.0.0.1:52144", token: TOKEN }, "bot 1", fetchImpl, "work")).resolves.toEqual({
       png: "ZmFrZQ==",
       format: "jpeg",
     });
-    expect(calls).toEqual([{ url: "http://127.0.0.1:52144/v1/bots/bot%201/screenshot", auth: `Bearer ${TOKEN}`, body: "{}" }]);
+    expect(calls).toEqual([
+      { url: "http://127.0.0.1:52144/v1/bots/bot%201/screenshot", auth: `Bearer ${TOKEN}`, body: JSON.stringify({ profile: "work" }) },
+    ]);
     const failing = (async () => new Response("{}", { status: 500 })) as typeof fetch;
     await expect(browserScreenshot({ url: "http://127.0.0.1:52144", token: TOKEN }, "bot-1", failing)).rejects.toThrow(/HTTP 500/);
   });

@@ -14,6 +14,7 @@
 //   OMB_BROWSER_URL    loopback host, e.g. http://127.0.0.1:52144
 //   OMB_BROWSER_TOKEN  per-boot bearer secret from browser-connection.json
 //   OMB_BOT_ID         which bot's tab to drive (one view per bot)
+//   OMB_BROWSER_PROFILE named shared session the bot is pointed at ("" = own)
 //   OMB_CONTROL_URL / OMB_CONTROL_TOKEN  who-is-driving endpoint: while the
 //                      person holds the wheel in the panel, actions refuse
 import { existsSync } from "node:fs";
@@ -26,6 +27,7 @@ import { CONTROL_REFUSAL, createControlClient } from "../control-client.ts";
 const HOST = (process.env.OMB_BROWSER_URL ?? "").replace(/\/$/, "");
 const TOKEN = process.env.OMB_BROWSER_TOKEN ?? "";
 const BOT_ID = process.env.OMB_BOT_ID ?? "";
+const PROFILE = process.env.OMB_BROWSER_PROFILE ?? "";
 const control = createControlClient();
 
 // ── what the host answers ────────────────────────────────────────────────
@@ -92,7 +94,7 @@ export async function hostRequest(operation: string, body: object = {}, fetchImp
   const res = await fetchImpl(`${HOST}/v1/bots/${encodeURIComponent(BOT_ID)}/${operation}`, {
     method: "POST",
     headers: { authorization: `Bearer ${TOKEN}`, "content-type": "application/json" },
-    body: JSON.stringify(body),
+    body: JSON.stringify({ ...body, profile: PROFILE }),
     signal: AbortSignal.timeout(operation === "navigate" ? 30_000 : 20_000),
   });
   const parsed: unknown = await res.json().catch(() => ({}));

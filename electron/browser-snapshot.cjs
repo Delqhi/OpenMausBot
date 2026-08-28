@@ -140,6 +140,14 @@ function browserPartition(botId) {
   return `persist:openmausbot-browser-${safe}`;
 }
 
+/** A named profile is a partition several bots may share — "Work", "Client
+ * A" — so one sign-in serves every bot pointed at it. */
+function browserProfilePartition(profileId) {
+  const safe = String(profileId ?? "").replace(/[^A-Za-z0-9_-]/g, "");
+  if (!safe) throw new Error("A profile id is required");
+  return `persist:openmausbot-browser-profile-${safe}`;
+}
+
 const REF = /^b(\d{1,12})$/;
 
 /** The backend DOM node id encoded in a snapshot ref. */
@@ -156,6 +164,7 @@ module.exports = {
   browserNavigationAllowed,
   browserNavigationUrl,
   browserPartition,
+  browserProfilePartition,
   browserUserAgent,
   formatSnapshot,
   snapshotFromAxNodes,

@@ -77,6 +77,7 @@ beforeAll(async () => {
       OMB_BROWSER_URL: `http://127.0.0.1:${stubPort}`,
       OMB_BROWSER_TOKEN: TOKEN,
       OMB_BOT_ID: "bot-1",
+      OMB_BROWSER_PROFILE: "work",
       OMB_CONTROL_URL: `http://127.0.0.1:${stubPort}/control`,
       OMB_CONTROL_TOKEN: CONTROL_TOKEN,
     },
@@ -123,7 +124,8 @@ describe("browser MCP proxy", () => {
   it("forwards navigation to the bot's own tab and returns the page with a scrubbed address", async () => {
     hits.length = 0;
     const res = await callTool("browser_navigate", { url: "shop.example/cart" });
-    expect(hits).toEqual([{ path: "/v1/bots/bot-1/navigate", auth: `Bearer ${TOKEN}`, body: { url: "shop.example/cart" } }]);
+    // every call pins the profile the bot was mounted with
+    expect(hits).toEqual([{ path: "/v1/bots/bot-1/navigate", auth: `Bearer ${TOKEN}`, body: { url: "shop.example/cart", profile: "work" } }]);
     expect(text(res)).toBe('Browser — Cart: https://shop.example/cart\nb1 link "Home"\nb2 textbox "Search" (value="shoes")');
     expect(res.result.isError).toBeFalsy();
   });
@@ -135,10 +137,10 @@ describe("browser MCP proxy", () => {
     await callTool("browser_press", { key: "enter" });
     await callTool("browser_scroll", { direction: "down", amount: 300 });
     expect(hits.map((hit) => [hit.path, hit.body])).toEqual([
-      ["/v1/bots/bot-1/click", { ref: "b1", double: true }],
-      ["/v1/bots/bot-1/fill", { ref: "b2", text: "boots" }],
-      ["/v1/bots/bot-1/press", { key: "enter" }],
-      ["/v1/bots/bot-1/scroll", { direction: "down", amount: 300 }],
+      ["/v1/bots/bot-1/click", { ref: "b1", double: true, profile: "work" }],
+      ["/v1/bots/bot-1/fill", { ref: "b2", text: "boots", profile: "work" }],
+      ["/v1/bots/bot-1/press", { key: "enter", profile: "work" }],
+      ["/v1/bots/bot-1/scroll", { direction: "down", amount: 300, profile: "work" }],
     ]);
     const stale = await callTool("browser_click", { ref: "b99" });
     expect(stale.result.isError).toBe(true);

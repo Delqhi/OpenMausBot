@@ -112,13 +112,53 @@ function nextRunLabel(at: number | null) {
   return `${sameDay ? "Today" : date.toLocaleDateString([], { month: "short", day: "numeric" })}, ${date.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })}`;
 }
 
+const PANEL_WIDTH_KEY = "omb-computer-panel-width";
+const PANEL_MIN_WIDTH = 360;
+const PANEL_MAX_WIDTH = 960;
+const PANEL_DEFAULT_WIDTH = 400;
+
+function readPanelWidth(): number {
+  try {
+    const stored = Number(localStorage.getItem(PANEL_WIDTH_KEY));
+    if (Number.isFinite(stored) && stored >= PANEL_MIN_WIDTH && stored <= PANEL_MAX_WIDTH) return stored;
+  } catch {
+    /* storage blocked — default width */
+  }
+  return PANEL_DEFAULT_WIDTH;
+}
+
 export function ComputerPanel({
   bot,
   onOpenVmWorkspace,
+  onExpandBrowser,
 }: {
   bot: Bot;
   onOpenVmWorkspace?: (botId: string) => void;
+  onExpandBrowser?: (botId: string) => void;
 }) {
+  // The panel is a fixed column by default; a drag handle on its left edge
+  // makes it wide enough to actually read a page in the Browser tab.
+  const [panelWidth, setPanelWidth] = useState(readPanelWidth);
+  const resizeFrom = useRef<{ x: number; width: number } | null>(null);
+  const onResizeStart = (event: React.PointerEvent<HTMLDivElement>) => {
+    resizeFrom.current = { x: event.clientX, width: panelWidth };
+    event.currentTarget.setPointerCapture(event.pointerId);
+  };
+  const onResizeMove = (event: React.PointerEvent<HTMLDivElement>) => {
+    if (!resizeFrom.current) return;
+    const next = Math.min(PANEL_MAX_WIDTH, Math.max(PANEL_MIN_WIDTH, resizeFrom.current.width + (resizeFrom.current.x - event.clientX)));
+    setPanelWidth(next);
+  };
+  const onResizeEnd = (event: React.PointerEvent<HTMLDivElement>) => {
+    if (!resizeFrom.current) return;
+    resizeFrom.current = null;
+    event.currentTarget.releasePointerCapture(event.pointerId);
+    try {
+      localStorage.setItem(PANEL_WIDTH_KEY, String(panelWidth));
+    } catch {
+      /* storage blocked — width lives for this session */
+    }
+  };
   const { state, dispatch } = useStore();
   const { capabilities, ready: capabilitiesReady } = useDesktopCapabilities();
   const localAvailable = capabilities.localComputer.available;
@@ -728,7 +768,20 @@ export function ComputerPanel({
 
   return (
     <>
-    <aside className="animate-panel-in flex h-full w-[400px] shrink-0 flex-col border-l border-hairline/40 bg-panel">
+    <aside
+      className="animate-panel-in relative flex h-full shrink-0 flex-col border-l border-hairline/40 bg-panel"
+      style={{ width: panelWidth }}
+    >
+      <div
+        role="separator"
+        aria-orientation="vertical"
+        aria-label="Resize panel"
+        onPointerDown={onResizeStart}
+        onPointerMove={onResizeMove}
+        onPointerUp={onResizeEnd}
+        onPointerCancel={onResizeEnd}
+        className="absolute inset-y-0 left-0 z-10 w-1.5 cursor-col-resize hover:bg-accent/40"
+      />
       {/* Header */}
       <div className="flex items-center justify-between px-4 py-3">
         <button
@@ -788,7 +841,13 @@ export function ComputerPanel({
 
       {panelView === "browser" && browserEnabled ? (
         <div className="flex min-h-0 flex-1 flex-col px-4 pb-4">
-          <BrowserPanel bot={bot} control={control} controlPending={controlPending} onControl={controlAction} />
+          <BrowserPanel
+            bot={bot}
+            control={control}
+            controlPending={controlPending}
+            onControl={controlAction}
+            onExpand={onExpandBrowser ? () => onExpandBrowser(bot.id) : undefined}
+          />
         </div>
       ) : panelView === "android" && androidConnected ? (
         <div className="flex-1 overflow-y-auto px-4 pt-2">

@@ -246,12 +246,15 @@ function agentsIntegration(botId: string, threadId: string, depth: number) {
  * gets the loopback host + per-boot token from the descriptor Electron
  * wrote, and the who-is-driving endpoint so a person taking the wheel in
  * the panel pauses the bot's hands. Null when there is no desktop app. */
-function browserIntegration(botId: string) {
+function browserIntegration(botId: string, profile: string | undefined) {
   const connection = readBrowserConnection();
   if (!connection) return null;
   const control = controlIntegration(botId);
+  // a profile that no longer exists falls back to the bot's own session
+  const profileId = profile && (cfg.browserProfiles ?? []).some((candidate) => candidate.id === profile) ? profile : "";
   return {
     connection,
+    profile: profileId,
     integration: {
       command: process.execPath,
       args: [SPAWNED_PROXIES.browser],
@@ -259,6 +262,7 @@ function browserIntegration(botId: string) {
         ...AGENTS_NODE_FLAG,
         OMB_BROWSER_URL: connection.url,
         OMB_BROWSER_TOKEN: connection.token,
+        OMB_BROWSER_PROFILE: profileId,
         OMB_BOT_ID: botId,
         OMB_CONTROL_URL: control.url,
         OMB_CONTROL_TOKEN: control.token,
@@ -1824,7 +1828,7 @@ async function startTurn(
       // the built-in browser: per-bot opt-in, and only to a driver that can
       // mount it, and only while the desktop app is running its host
       const browser = builtInBrowserEnabled(cfg) && bot.browser !== false && instance.adapter.capabilities.browserMcp === true
-        ? browserIntegration(bot.id)
+        ? browserIntegration(bot.id, bot.browserProfile)
         : null;
       if (browser) integrations.browser = browser.integration;
       // the user's connected apps, but only to a driver that can mount
@@ -2139,8 +2143,8 @@ async function startTurn(
       // keep polling the box forever, carrying dead per-turn state. busy
       // is flipped false in the fold, so it is the honest "still running".
       if (!previewCapture && browser) {
-        const connection = browser.connection;
-        previewCapture = () => browserScreenshot(connection, bot.id);
+        const { connection, profile } = browser;
+        previewCapture = () => browserScreenshot(connection, bot.id, fetch, profile);
       }
       if (previewCapture && store.bot(bot.id)?.busy) {
         startScreenPoller(bot.id, previewCapture, { screenIsTheWork: instance.driverKind === "boxAgent" });
@@ -2474,7 +2478,7 @@ async function runGroupMemberTurn(
     integrations.phone = phoneIntegration();
   }
   if (builtInBrowserEnabled(cfg) && bot.browser !== false && instance.adapter.capabilities.browserMcp === true) {
-    const browser = browserIntegration(bot.id);
+    const browser = browserIntegration(bot.id, bot.browserProfile);
     if (browser) integrations.browser = browser.integration;
   }
   try {
@@ -3146,6 +3150,7 @@ function configStatus() {
       showToolCalls: showToolCallsEnabled(cfg),
       browser: builtInBrowserEnabled(cfg),
     },
+    browserProfiles: cfg.browserProfiles ?? [],
   };
 }
 
@@ -4876,6 +4881,16 @@ const server = createServer(async (req, res) => {
         if (typeof body.browser !== "boolean") return json(res, 400, { error: "browser must be true or false" });
         patch.browser = body.browser;
       }
+      // which named browser session this bot uses; null/"" = its own
+      if (body.browserProfile !== undefined) {
+        if (body.browserProfile === null || body.browserProfile === "") patch.browserProfile = undefined;
+        else if (
+          typeof body.browserProfile === "string" &&
+          (cfg.browserProfiles ?? []).some((profile) => profile.id === body.browserProfile)
+        ) {
+          patch.browserProfile = body.browserProfile;
+        } else return json(res, 400, { error: "browserProfile must name an existing browser profile" });
+      }
       if (
         body.computer !== undefined &&
         !["cloud", "vm", "local", "off"].includes(String(body.computer))
@@ -5823,7 +5838,8 @@ const server = createServer(async (req, res) => {
           key !== "vps" &&
           key !== "rooms" &&
           key !== "localVm" &&
-          key !== "features",
+          key !== "features" &&
+          key !== "browserProfiles",
       );
       if (reloadKeys.length > 0) await reloadProviders();
       const status = configStatus();

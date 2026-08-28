@@ -58,27 +58,30 @@ function json(res, status, body) {
 /** Map a verb + body onto the manager; the body's field names are the tool
  * argument names the proxy uses, kept in one place here. */
 async function perform(manager, botId, operation, body) {
+  // "" pins the bot's own session; a name pins a shared profile; absent
+  // leaves whatever tab exists alone
+  const profile = Object.prototype.toString.call(body.profile) === "[object String]" ? body.profile : undefined;
   switch (operation) {
     case "state":
       return manager.state(botId);
     case "navigate":
-      return manager.navigate(botId, body.url);
+      return manager.navigate(botId, body.url, profile);
     case "back":
-      return manager.back(botId);
+      return manager.back(botId, profile);
     case "snapshot":
-      return manager.snapshot(botId);
+      return manager.snapshot(botId, profile);
     case "click":
-      return manager.click(botId, body.ref, { button: body.button, clickCount: body.double === true ? 2 : 1 });
+      return manager.click(botId, body.ref, { button: body.button, clickCount: body.double === true ? 2 : 1, profile });
     case "fill":
-      return manager.fill(botId, body.ref, body.text);
+      return manager.fill(botId, body.ref, body.text, profile);
     case "type":
-      return manager.type(botId, body.text);
+      return manager.type(botId, body.text, profile);
     case "press":
-      return manager.press(botId, body.key);
+      return manager.press(botId, body.key, profile);
     case "scroll":
-      return manager.scroll(botId, body.direction, body.amount);
+      return manager.scroll(botId, body.direction, body.amount, profile);
     case "screenshot":
-      return manager.screenshot(botId);
+      return manager.screenshot(botId, profile);
     default:
       throw new Error(`unknown browser operation: ${operation}`);
   }

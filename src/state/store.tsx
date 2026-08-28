@@ -240,6 +240,9 @@ export interface Bot {
   composio?: boolean;
   /** Whether this bot gets the app's built-in browser (Browser tab). On unless switched off. */
   browser?: boolean;
+  /** Named browser profile id (config.browserProfiles); absent/null = the
+   * bot's own session (null is how a clear travels over PATCH). */
+  browserProfile?: string | null;
   messages: Message[];
   /** leaf of the visible conversation branch (see visibleMessages) */
   activeLeafId?: string | null;
@@ -291,11 +294,18 @@ export interface ConfigStatus {
   profile?: { name: string; email: string };
   /** Opt-in flags. Absent means off. */
   features?: { skillRecorder: boolean; showToolCalls?: boolean; browser?: boolean };
+  /** Named browser sessions any bot can be pointed at. */
+  browserProfiles?: BrowserProfile[];
+}
+
+export interface BrowserProfile {
+  id: string;
+  name: string;
 }
 
 export type ConfigStatusFrame = Pick<
   ConfigStatus,
-  "xai" | "composio" | "box" | "vps" | "rooms" | "localVm" | "opencodeGo" | "tts" | "imageGen" | "profile" | "features"
+  "xai" | "composio" | "box" | "vps" | "rooms" | "localVm" | "opencodeGo" | "tts" | "imageGen" | "profile" | "features" | "browserProfiles"
 >;
 
 export function configStatusFromFrame(frame: ConfigStatusFrame): ConfigStatus {
@@ -311,6 +321,7 @@ export function configStatusFromFrame(frame: ConfigStatusFrame): ConfigStatus {
     imageGen: frame.imageGen,
     profile: frame.profile,
     features: frame.features,
+    browserProfiles: frame.browserProfiles,
   };
 }
 

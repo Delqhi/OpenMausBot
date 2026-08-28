@@ -404,6 +404,9 @@ export interface BotRecord {
   /** Whether this bot gets the app's built-in browser (the Browser tab of
    * the computer panel). On unless switched off. */
   browser?: boolean;
+  /** Id of a named browser profile from config.browserProfiles; absent = the
+   * bot's own private session. */
+  browserProfile?: string;
   /** Public, package-authored playbooks installed for this bot. They carry
    * process guidance only—never executable code, credentials, or grants. */
   playbooks?: InstalledPlaybook[];

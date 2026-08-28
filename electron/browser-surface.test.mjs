@@ -199,6 +199,26 @@ describe("browser surface manager", () => {
     expect(shot).toMatchObject({ format: "jpeg", width: 1024, png: Buffer.from("jpeg").toString("base64") });
   });
 
+  it("points a bot at a shared named profile, and switching profiles replaces its tab", async () => {
+    const { manager, owner, views, partitions, states } = harness();
+    manager.layout("bot-a", { x: 0, y: 0, width: 100, height: 100 }, "work");
+    manager.layout("bot-b", { x: 0, y: 0, width: 100, height: 100 }, "work");
+    // one session for both bots — a sign-in in one is a sign-in in the other
+    expect(partitions).toEqual(["persist:openmausbot-browser-profile-work", "persist:openmausbot-browser-profile-work"]);
+    expect(manager.state("bot-a").partition).toBe("persist:openmausbot-browser-profile-work");
+    // a caller that does not know the profile never evicts the tab
+    await manager.navigate("bot-a", "https://example.com");
+    expect(views).toHaveLength(2);
+    // back to the bot's own session: the old tab is torn down and replaced
+    manager.layout("bot-a", { x: 0, y: 0, width: 100, height: 100 }, "");
+    expect(views).toHaveLength(3);
+    expect(partitions.at(-1)).toBe("persist:openmausbot-browser-bot-a");
+    expect(owner.contentView.children).toHaveLength(2);
+    expect(states.some((state) => state.botId === "bot-a" && state.open === false && state.code === "profile-changed")).toBe(true);
+    expect(() => manager.layout("bot-a", { x: 0, y: 0, width: 100, height: 100 }, "../evil")).not.toThrow();
+    expect(partitions.at(-1)).toBe("persist:openmausbot-browser-profile-evil");
+  });
+
   it("tears every view down on closeAll and hides them all on hideAll", async () => {
     const { manager, owner, views, states } = harness();
     manager.layout("bot-a", { x: 0, y: 0, width: 100, height: 100 });

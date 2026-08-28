@@ -104,11 +104,12 @@ export async function browserScreenshot(
   connection: BrowserConnection,
   botId: string,
   fetchImpl: typeof fetch = fetch,
+  profile = "",
 ): Promise<{ png: string; format: string }> {
   const res = await fetchImpl(`${connection.url}/v1/bots/${encodeURIComponent(botId)}/screenshot`, {
     method: "POST",
     headers: { authorization: `Bearer ${connection.token}`, "content-type": "application/json" },
-    body: "{}",
+    body: JSON.stringify({ profile }),
     signal: AbortSignal.timeout(10_000),
   });
   if (!res.ok) throw new Error(`browser screenshot: HTTP ${res.status}`);

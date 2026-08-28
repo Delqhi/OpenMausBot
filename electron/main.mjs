@@ -1049,7 +1049,9 @@ function browserSurfaceForEvent(event) {
 
 ipcMain.handle("browser:available", () => Boolean(browserSurface && browserHost?.url));
 ipcMain.handle("browser:state", (event, botId) => browserSurfaceForEvent(event).state(botId));
-ipcMain.handle("browser:layout", (event, botId, bounds) => browserSurfaceForEvent(event).layout(botId, bounds ?? null));
+ipcMain.handle("browser:layout", (event, botId, bounds, profile) =>
+  browserSurfaceForEvent(event).layout(botId, bounds ?? null, Object.prototype.toString.call(profile) === "[object String]" ? profile : undefined),
+);
 ipcMain.handle("browser:navigate", async (event, botId, url) => {
   const result = await browserSurfaceForEvent(event).navigate(botId, url);
   return { url: result.url, title: result.title };
