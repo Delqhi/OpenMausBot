@@ -20,6 +20,8 @@
 // never reach file://, chrome:// or the app's own origin.
 "use strict";
 
+const fs = require("node:fs");
+const path = require("node:path");
 const { normalizeDesktopWorkspaceBounds } = require("./desktop-workspace.cjs");
 const {
   backendNodeIdFromRef,
@@ -71,6 +73,19 @@ const KEYS = {
 };
 
 const SCROLL_DIRECTIONS = { up: [0, -1], down: [0, 1], left: [-1, 0], right: [1, 0] };
+const INJECTED_BUNDLE = path.join(__dirname, "resources", "browser-snapshot.js");
+const SNAPSHOT_MAX_CHARS = 60_000;
+
+/** Playwright's accessibility snapshot, bundled for the page
+ * (scripts/build-browser-snapshot.mjs). Missing only in a broken checkout;
+ * the surface then falls back to the bare accessibility tree. */
+function loadInjectedSource() {
+  try {
+    return fs.readFileSync(INJECTED_BUNDLE, "utf8");
+  } catch {
+    return null;
+  }
+}
 
 function botIdOf(value) {
   const id = String(value ?? "");
@@ -112,6 +127,7 @@ function createBrowserSurfaceManager({
   settleMs = SETTLE_MS,
   maxViews = MAX_VIEWS,
   now = () => Date.now(),
+  injectedSource = loadInjectedSource(),
 }) {
   if (!owner || owner.isDestroyed?.()) throw new Error("The OpenMausBot window is unavailable");
   if (createView?.constructor !== Function) throw new Error("The browser surface viewer is unavailable");
@@ -276,6 +292,7 @@ function createBrowserSurfaceManager({
       bounds: null,
       mode: null,
       refs: null,
+      refKind: "ax",
       dialogs: [],
       lastUsed: now(),
     };
@@ -418,25 +435,63 @@ function createBrowserSurfaceManager({
     }
   };
 
+  /** Make sure the page carries our snapshot script (a fresh document loses
+   * it). False when the bundle is missing or the page refuses scripts. */
+  const ensureInjected = async (entry) => {
+    if (!injectedSource) return false;
+    try {
+      if ((await evaluate(entry, "Boolean(window.__ombBrowser)")) === true) return true;
+      await cdp(entry, "Runtime.evaluate", { expression: injectedSource, returnByValue: true });
+      return (await evaluate(entry, "Boolean(window.__ombBrowser)")) === true;
+    } catch {
+      return false;
+    }
+  };
+
+  /** Playwright's ARIA snapshot with `[ref=eN]` refs — what models were
+   * trained to read. Falls back to the bare accessibility tree (`bN` refs)
+   * when the script cannot run. */
   const snapshot = async (entry) => {
-    await cdp(entry, "Accessibility.enable");
-    const { nodes = [] } = await cdp(entry, "Accessibility.getFullAXTree", { depth: AX_TREE_DEPTH });
-    const elements = snapshotFromAxNodes(nodes);
-    entry.refs = new Set(elements.map((element) => element.ref));
     const state = stateFor(entry);
+    let elements = [];
+    let yaml = null;
+    let truncated = false;
+    if (await ensureInjected(entry)) {
+      try {
+        const result = await evaluate(entry, `window.__ombBrowser.snapshot(${SNAPSHOT_MAX_CHARS})`);
+        if (result && isString(result.yaml) && Array.isArray(result.refs)) {
+          yaml = result.yaml;
+          truncated = result.truncated === true;
+          entry.refs = new Set(result.refs.map(String));
+          entry.refKind = "aria";
+        }
+      } catch {
+        yaml = null;
+      }
+    }
+    if (yaml === null) {
+      await cdp(entry, "Accessibility.enable");
+      const { nodes = [] } = await cdp(entry, "Accessibility.getFullAXTree", { depth: AX_TREE_DEPTH });
+      elements = snapshotFromAxNodes(nodes);
+      entry.refs = new Set(elements.map((element) => element.ref));
+      entry.refKind = "ax";
+    }
     const dialogs = entry.dialogs.splice(0);
     const hint = await scrollHint(entry);
     const notes = [
       ...dialogs.map((dialog) => `Dialog (${dialog.type}) was answered automatically: ${JSON.stringify(dialog.message)}`),
       ...(hint ? [hint] : []),
     ];
+    const body = yaml !== null ? yaml || "(empty page)" : formatSnapshot({ title: state.title, url: state.url, elements });
     return {
       url: state.url,
       title: state.title,
       elements,
+      yaml,
+      truncated,
       dialogs,
       notes,
-      text: [formatSnapshot({ title: state.title, url: state.url, elements }), ...notes].join("\n"),
+      text: [yaml !== null ? `Browser — ${state.title || "Untitled"}: ${state.url || "about:blank"}` : "", body, ...notes].filter(Boolean).join("\n"),
     };
   };
 
@@ -445,12 +500,21 @@ function createBrowserSurfaceManager({
     return snapshot(entry);
   };
 
+  /** Where a ref is, in viewport CSS pixels — plus what the two ref kinds
+   * need to act on it: the DOM node id (accessibility refs) or nothing more
+   * (Playwright refs resolve in the page). */
   const centerOf = async (entry, ref) => {
-    const backendNodeId = backendNodeIdFromRef(ref);
-    if (entry.refs && !entry.refs.has(String(ref).trim())) {
-      throw new Error("that browser ref is stale or unknown — take a new browser_snapshot");
-    }
+    const wanted = String(ref ?? "").trim();
     if (!entry.refs) throw new Error("the page changed since the last browser_snapshot — take a new one");
+    if (!entry.refs.has(wanted)) throw new Error("that browser ref is stale or unknown — take a new browser_snapshot");
+    if (entry.refKind === "aria") {
+      const box = await evaluate(entry, `window.__ombBrowser ? window.__ombBrowser.boxForRef(${JSON.stringify(wanted)}) : { found: false }`);
+      if (!box || box.found !== true) throw new Error("that browser ref is stale or unknown — take a new browser_snapshot");
+      if (box.connected !== true) throw new Error("that element is gone; take a new browser_snapshot");
+      if (box.visible !== true) throw new Error("that element is not visible; take a new browser_snapshot");
+      return { ref: wanted, x: box.x, y: box.y };
+    }
+    const backendNodeId = backendNodeIdFromRef(wanted);
     try {
       await cdp(entry, "DOM.scrollIntoViewIfNeeded", { backendNodeId });
     } catch {
@@ -586,8 +650,13 @@ function createBrowserSurfaceManager({
       const entry = ensure(botId, profile);
       const value = String(text ?? "");
       if (value.length > MAX_TEXT) throw new Error(`text is limited to ${MAX_TEXT} characters`);
-      const { backendNodeId } = await centerOf(entry, ref);
-      await cdp(entry, "DOM.focus", { backendNodeId });
+      const target = await centerOf(entry, ref);
+      if (entry.refKind === "aria") {
+        const focused = await evaluate(entry, `window.__ombBrowser.focusRef(${JSON.stringify(target.ref)})`);
+        if (focused !== true) throw new Error("that element cannot take keyboard focus; click it first or pick a text field");
+      } else {
+        await cdp(entry, "DOM.focus", { backendNodeId: target.backendNodeId });
+      }
       await cdp(entry, "Input.dispatchKeyEvent", { type: "keyDown", key: "a", code: "KeyA", windowsVirtualKeyCode: 65, modifiers: selectAllModifiers });
       await cdp(entry, "Input.dispatchKeyEvent", { type: "keyUp", key: "a", code: "KeyA", windowsVirtualKeyCode: 65, modifiers: selectAllModifiers });
       await cdp(entry, "Input.dispatchKeyEvent", { type: "keyDown", ...KEYS.backspace });
@@ -629,11 +698,21 @@ function createBrowserSurfaceManager({
       const entry = ensure(botId, profile);
       const values = (Array.isArray(rawValues) ? rawValues : [rawValues]).map((value) => String(value ?? "")).filter(Boolean);
       if (!values.length) throw new Error("at least one option value or label is required");
-      const { backendNodeId } = await centerOf(entry, ref);
-      const { object } = await cdp(entry, "DOM.resolveNode", { backendNodeId });
-      if (!object?.objectId) throw new Error("that element is gone; take a new browser_snapshot");
+      const target = await centerOf(entry, ref);
+      let objectId;
+      if (entry.refKind === "aria") {
+        const { result: handle } = await cdp(entry, "Runtime.evaluate", {
+          expression: `window.__ombBrowser.elementForRef(${JSON.stringify(target.ref)})`,
+          returnByValue: false,
+        });
+        objectId = handle?.objectId;
+      } else {
+        const { object } = await cdp(entry, "DOM.resolveNode", { backendNodeId: target.backendNodeId });
+        objectId = object?.objectId;
+      }
+      if (!objectId) throw new Error("that element is gone; take a new browser_snapshot");
       const { result, exceptionDetails } = await cdp(entry, "Runtime.callFunctionOn", {
-        objectId: object.objectId,
+        objectId,
         returnByValue: true,
         arguments: [{ value: values }],
         functionDeclaration: `function (wanted) {

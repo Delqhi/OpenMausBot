@@ -79,7 +79,20 @@ function fakeView(partition) {
         if (method === "DOM.resolveNode") return { object: { objectId: `obj-${params.backendNodeId}` } };
         if (method === "Runtime.callFunctionOn") return { result: { value: { chosen: ["India"] } } };
         if (method === "Runtime.evaluate") {
-          if (params.expression.includes("scrollingElement")) return { result: { value: { top: 0, height: 2400, view: 800 } } };
+          const expression = String(params.expression);
+          if (expression === "/*injected*/") {
+            view.injected = true;
+            return { result: { value: undefined } };
+          }
+          if (expression.includes("Boolean(window.__ombBrowser)")) return { result: { value: view.injected === true } };
+          if (expression.includes("__ombBrowser.snapshot(")) return { result: { value: { yaml: '- heading "Docs" [ref=e1]\n- textbox "Search" [ref=e2]', refs: ["e1", "e2"], truncated: false } } };
+          if (expression.includes("boxForRef")) {
+            if (expression.includes('"e9"')) return { result: { value: { found: false } } };
+            return { result: { value: { found: true, connected: true, visible: true, x: 77, y: 33 } } };
+          }
+          if (expression.includes("focusRef")) return { result: { value: true } };
+          if (expression.includes("elementForRef")) return { result: { objectId: "obj-e1" } };
+          if (expression.includes("scrollingElement")) return { result: { value: { top: 0, height: 2400, view: 800 } } };
           return { result: { value: pageText } };
         }
         if (method === "Page.captureScreenshot") return { data: Buffer.from("cdp-jpeg").toString("base64") };
@@ -255,7 +268,7 @@ describe("browser surface manager", () => {
     const { manager, views } = harness();
     await manager.navigate("bot-a", "https://example.com");
     await expect(manager.click("bot-a", "b99")).rejects.toThrow(/stale or unknown/);
-    await expect(manager.click("bot-a", "nope")).rejects.toThrow(/invalid or stale/);
+    await expect(manager.click("bot-a", "nope")).rejects.toThrow(/stale or unknown/);
     await manager.click("bot-a", "b11");
     const mouse = cdpCalls(views[0]).filter(([name]) => name === "Input.dispatchMouseEvent").map(([, params]) => params);
     expect(mouse).toEqual([
@@ -332,6 +345,35 @@ describe("browser surface manager", () => {
     expect(page.dialogs).toEqual([{ type: "confirm", message: "Leave page?" }]);
     expect(page.text).toContain('Dialog (confirm) was answered automatically: "Leave page?"');
     expect((await manager.snapshot("bot-a")).dialogs).toEqual([]);
+  });
+
+  it("uses Playwright's snapshot with e-refs when the page carries the script, injecting it once per document", async () => {
+    const { manager, views } = harness({ injectedSource: "/*injected*/" });
+    const page = await manager.navigate("bot-a", "https://example.com");
+    expect(page.yaml).toBe('- heading "Docs" [ref=e1]\n- textbox "Search" [ref=e2]');
+    expect(page.text).toContain('[ref=e1]');
+    expect(page.elements).toEqual([]);
+    // injected exactly once, then reused
+    const injections = views[0].calls.filter(([name, params]) => name === "Runtime.evaluate" && params.expression === "/*injected*/");
+    expect(injections).toHaveLength(1);
+    await manager.snapshot("bot-a");
+    expect(views[0].calls.filter(([name, params]) => name === "Runtime.evaluate" && params.expression === "/*injected*/")).toHaveLength(1);
+    // clicks resolve through the page, at the element's centre
+    await manager.click("bot-a", "e1");
+    const pressed = cdpCalls(views[0]).find(([name, params]) => name === "Input.dispatchMouseEvent" && params.type === "mousePressed")[1];
+    expect(pressed).toMatchObject({ x: 77, y: 33 });
+    await expect(manager.click("bot-a", "e9")).rejects.toThrow(/stale or unknown/);
+    await expect(manager.click("bot-a", "b11")).rejects.toThrow(/stale or unknown/);
+    // fill focuses through the page; select resolves the element handle through the page
+    await manager.fill("bot-a", "e2", "shoes");
+    expect(cdpCalls(views[0]).some(([name]) => name === "DOM.focus")).toBe(false);
+    await manager.select("bot-a", "e2", "India");
+    expect(cdpCalls(views[0]).find(([name]) => name === "Runtime.callFunctionOn")[1].objectId).toBe("obj-e1");
+    // no bundle → the bare accessibility tree with b-refs
+    const bare = harness({ injectedSource: null });
+    const fallback = await bare.manager.navigate("bot-a", "https://example.com");
+    expect(fallback.yaml).toBeNull();
+    expect(fallback.elements.map((element) => element.ref)).toEqual(["b11", "b12", "b13"]);
   });
 
   it("tears every view down on closeAll and hides them all on hideAll", async () => {

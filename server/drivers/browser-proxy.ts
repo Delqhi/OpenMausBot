@@ -43,6 +43,8 @@ const pageSchema = z.object({
   url: z.string().default(""),
   title: z.string().default(""),
   elements: z.array(elementSchema).default([]),
+  /** Playwright-style ARIA snapshot with [ref=eN] refs; absent when the surface fell back to the bare tree */
+  yaml: z.string().nullable().optional(),
   /** what the surface did or noticed on the bot's behalf: answered dialogs, off-screen content */
   notes: z.array(z.string()).default([]),
 });
@@ -51,7 +53,7 @@ const screenshotSchema = z.object({ png: z.string().min(1), format: z.string().o
 const hostErrorSchema = z.object({ error: z.string().min(1) });
 
 export type ObservedElement = z.infer<typeof elementSchema>;
-export type ObservedPage = Omit<z.infer<typeof pageSchema>, "notes"> & { notes?: string[] };
+export type ObservedPage = Omit<z.infer<typeof pageSchema>, "notes" | "yaml"> & { notes?: string[]; yaml?: string | null };
 
 // ── what the model sends ─────────────────────────────────────────────────
 const refSchema = z.string().trim().min(1, "a ref from browser_snapshot is required");
@@ -87,6 +89,9 @@ const rpcMessageSchema = z.object({
  * keeps the real one. */
 export function formatObserved(page: ObservedPage): string {
   const url = safeBrowserUrl(page.url) ?? (page.url === "about:blank" ? "about:blank" : "URL unavailable");
+  if (page.yaml !== undefined && page.yaml !== null) {
+    return [`Browser — ${page.title || "Untitled"}: ${url}`, page.yaml || "(empty page)", ...(page.notes ?? [])].join("\n");
+  }
   const lines = page.elements.map((element) => {
     const flags = [
       element.disabled ? "disabled" : "",

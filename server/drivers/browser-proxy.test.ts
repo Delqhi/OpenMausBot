@@ -201,6 +201,12 @@ describe("browser MCP proxy", () => {
 });
 
 describe("formatObserved", () => {
+  it("prefers the Playwright-style snapshot when the surface has one", () => {
+    expect(
+      formatObserved({ url: "https://a.example/p?token=1", title: "T", elements: [], yaml: '- link "Docs" [ref=e1]', notes: ["900px below"] }),
+    ).toBe('Browser — T: https://a.example/p\n- link "Docs" [ref=e1]\n900px below');
+  });
+
   it("scrubs query and fragment and names an empty tab", () => {
     expect(formatObserved({ url: "https://a.example/p?token=1#x", title: "T", elements: [] })).toBe(
       "Browser — T: https://a.example/p\nNo interactive elements found.",
