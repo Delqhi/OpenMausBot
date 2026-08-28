@@ -166,6 +166,13 @@ describe("browser surface manager", () => {
     expect(manager.layout("bot-a", null)).toMatchObject({ botId: "bot-a", open: false });
     expect(views).toHaveLength(0);
 
+    // a view that exists but is not laid out still has a real viewport
+    manager.ensure("bot-z", "");
+    expect(views[0].bounds).toEqual({ x: 0, y: 0, width: VIEWPORT.width, height: VIEWPORT.height });
+    expect(views[0].visible).toBe(false);
+    manager.close("bot-z");
+    views.length = 0;
+
     const state = manager.layout("bot-a", { x: 20.4, y: 30.6, width: 5000, height: 300 }, "", "compact");
     expect(views).toHaveLength(1);
     expect(views[0].partition).toBe("persist:openmausbot-browser-bot-a");
