@@ -343,6 +343,7 @@ export function SettingsPanel({ bot }: { bot: Bot }) {
         | "chiefOfStaff"
         | "approvePeerComms"
         | "composio"
+        | "browser"
         | "modelSelection"
       >
     > & { acknowledgeLocalAuto?: boolean },

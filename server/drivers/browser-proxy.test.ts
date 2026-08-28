@@ -1,0 +1,177 @@
+// The browser proxy end to end: spawn it the way a driver's mcpServers entry
+// does, point it at a stub of the Electron browser host, and read what a
+// model would read.
+import { spawn, type ChildProcess } from "node:child_process";
+import { createServer, type Server } from "node:http";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
+
+import { formatObserved } from "./browser-proxy.ts";
+
+const PROXY = join(dirname(fileURLToPath(import.meta.url)), "browser-proxy.ts");
+const TOKEN = "b".repeat(64);
+const CONTROL_TOKEN = "control-token";
+
+let stub: Server;
+let stubPort = 0;
+let held = false;
+const hits: Array<{ path: string; auth: string | undefined; body: Record<string, unknown> }> = [];
+let child: ChildProcess;
+const pending = new Map<number, (msg: any) => void>();
+let nextId = 100;
+
+function rpc(method: string, params?: unknown): Promise<any> {
+  return new Promise((resolve, reject) => {
+    const id = nextId++;
+    pending.set(id, resolve);
+    child.stdin!.write(JSON.stringify({ jsonrpc: "2.0", id, method, params }) + "\n");
+    setTimeout(() => {
+      if (pending.delete(id)) reject(new Error(`${method} timed out`));
+    }, 10_000).unref?.();
+  });
+}
+const callTool = (name: string, args: unknown) => rpc("tools/call", { name, arguments: args });
+const text = (res: any) => String(res.result.content[0].text);
+
+const PAGE = {
+  url: "https://shop.example/cart?session=secret#frag",
+  title: "Cart",
+  elements: [
+    { ref: "b1", role: "link", name: "Home" },
+    { ref: "b2", role: "textbox", name: "Search", value: "shoes" },
+  ],
+};
+
+beforeAll(async () => {
+  stub = createServer((req, res) => {
+    let raw = "";
+    req.on("data", (chunk) => (raw += chunk));
+    req.on("end", () => {
+      const path = req.url ?? "";
+      if (path === "/control") {
+        res.writeHead(200, { "content-type": "application/json" });
+        return res.end(JSON.stringify({ held, helpOpen: false }));
+      }
+      const body = raw ? JSON.parse(raw) : {};
+      hits.push({ path, auth: req.headers.authorization, body });
+      if (req.headers.authorization !== `Bearer ${TOKEN}`) {
+        res.writeHead(401, { "content-type": "application/json" });
+        return res.end(JSON.stringify({ error: "unauthorized" }));
+      }
+      res.setHeader("content-type", "application/json");
+      if (path.endsWith("/click") && body.ref === "b99") {
+        res.writeHead(400);
+        return res.end(JSON.stringify({ error: "that browser ref is stale or unknown — take a new browser_snapshot" }));
+      }
+      if (path.endsWith("/state")) return res.end(JSON.stringify({ url: PAGE.url, title: PAGE.title, loading: true }));
+      if (path.endsWith("/screenshot")) return res.end(JSON.stringify({ png: "ZmFrZQ==", format: "jpeg" }));
+      res.end(JSON.stringify(PAGE));
+    });
+  });
+  await new Promise<void>((resolve) => stub.listen(0, "127.0.0.1", resolve));
+  stubPort = (stub.address() as { port: number }).port;
+  child = spawn(process.execPath, ["--experimental-strip-types", PROXY], {
+    env: {
+      ...process.env,
+      OMB_BROWSER_URL: `http://127.0.0.1:${stubPort}`,
+      OMB_BROWSER_TOKEN: TOKEN,
+      OMB_BOT_ID: "bot-1",
+      OMB_CONTROL_URL: `http://127.0.0.1:${stubPort}/control`,
+      OMB_CONTROL_TOKEN: CONTROL_TOKEN,
+    },
+    stdio: ["pipe", "pipe", "inherit"],
+  });
+  let buffer = "";
+  child.stdout!.on("data", (chunk) => {
+    buffer += chunk;
+    let index;
+    while ((index = buffer.indexOf("\n")) >= 0) {
+      const line = buffer.slice(0, index);
+      buffer = buffer.slice(index + 1);
+      if (!line.trim()) continue;
+      const message = JSON.parse(line);
+      pending.get(message.id)?.(message);
+      pending.delete(message.id);
+    }
+  });
+  await rpc("initialize", { protocolVersion: "2024-11-05" });
+});
+
+afterAll(async () => {
+  child.kill();
+  await new Promise<void>((resolve) => stub.close(() => resolve()));
+});
+
+describe("browser MCP proxy", () => {
+  it("advertises the browser tool surface", async () => {
+    const list = await rpc("tools/list");
+    expect(list.result.tools.map((tool: { name: string }) => tool.name)).toEqual([
+      "browser_navigate",
+      "browser_snapshot",
+      "browser_click",
+      "browser_fill",
+      "browser_type",
+      "browser_press",
+      "browser_scroll",
+      "browser_back",
+      "browser_state",
+      "browser_screenshot",
+    ]);
+  });
+
+  it("forwards navigation to the bot's own tab and returns the page with a scrubbed address", async () => {
+    hits.length = 0;
+    const res = await callTool("browser_navigate", { url: "shop.example/cart" });
+    expect(hits).toEqual([{ path: "/v1/bots/bot-1/navigate", auth: `Bearer ${TOKEN}`, body: { url: "shop.example/cart" } }]);
+    expect(text(res)).toBe('Browser — Cart: https://shop.example/cart\nb1 link "Home"\nb2 textbox "Search" (value="shoes")');
+    expect(res.result.isError).toBeFalsy();
+  });
+
+  it("acts on refs and relays the host's own sentence when one is stale", async () => {
+    hits.length = 0;
+    await callTool("browser_click", { ref: "b1", double: true });
+    await callTool("browser_fill", { ref: "b2", text: "boots" });
+    await callTool("browser_press", { key: "enter" });
+    await callTool("browser_scroll", { direction: "down", amount: 300 });
+    expect(hits.map((hit) => [hit.path, hit.body])).toEqual([
+      ["/v1/bots/bot-1/click", { ref: "b1", double: true }],
+      ["/v1/bots/bot-1/fill", { ref: "b2", text: "boots" }],
+      ["/v1/bots/bot-1/press", { key: "enter" }],
+      ["/v1/bots/bot-1/scroll", { direction: "down", amount: 300 }],
+    ]);
+    const stale = await callTool("browser_click", { ref: "b99" });
+    expect(stale.result.isError).toBe(true);
+    expect(text(stale)).toMatch(/stale or unknown/);
+    const missing = await callTool("browser_click", {});
+    expect(missing.result.isError).toBe(true);
+  });
+
+  it("reads state and screenshots without touching the page", async () => {
+    const state = await callTool("browser_state", {});
+    expect(text(state)).toBe("Cart: https://shop.example/cart (still loading)");
+    const shot = await callTool("browser_screenshot", {});
+    expect(shot.result.content[1]).toEqual({ type: "image", data: "ZmFrZQ==", mimeType: "image/jpeg" });
+  });
+
+  it("refuses to act while the person holds the wheel, but still lets the bot look", async () => {
+    held = true;
+    // the control client caches its answer briefly; wait it out
+    await new Promise((resolve) => setTimeout(resolve, 900));
+    const refused = await callTool("browser_click", { ref: "b1" });
+    expect(refused.result.isError).toBe(true);
+    expect(text(refused)).toMatch(/wheel|control|driving/i);
+    const look = await callTool("browser_snapshot", {});
+    expect(look.result.isError).toBeFalsy();
+    held = false;
+  });
+});
+
+describe("formatObserved", () => {
+  it("scrubs query and fragment and names an empty tab", () => {
+    expect(formatObserved({ url: "https://a.example/p?token=1#x", title: "T", elements: [] })).toBe(
+      "Browser — T: https://a.example/p\nNo interactive elements found.",
+    );
+    expect(formatObserved({ url: "about:blank", title: "", elements: [] })).toContain("about:blank");
+  });
+});

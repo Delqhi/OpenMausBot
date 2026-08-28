@@ -142,6 +142,7 @@ import { RepeatDetector, callKey } from "./repeat-detector.ts";
 import { redactSecretsInText } from "./redact.ts";
 import * as vps from "./vps-computer.ts";
 import { RoutineManager, type RoutineRunOn, type RoutineRunTrigger } from "./routines.ts";
+import { browserScreenshot, readBrowserConnection } from "./browser-connection.ts";
 import { RoutineRequestService } from "./routine-requests.ts";
 import { fetchBotDirectory, matchDirectoryBots, type MatchedDirectoryBot } from "./bot-directory.ts";
 import { scoutProject, suggestTeam } from "./project-scout.ts";
@@ -236,6 +237,31 @@ function agentsIntegration(botId: string, threadId: string, depth: number) {
       OMB_THREAD_ID: threadId,
       OMB_COMMS_TOKEN: COMMS_TOKEN,
       OMB_TURN_DEPTH: String(depth),
+    },
+  };
+}
+
+/** The built-in browser, when the desktop app has one running: the proxy
+ * gets the loopback host + per-boot token from the descriptor Electron
+ * wrote, and the who-is-driving endpoint so a person taking the wheel in
+ * the panel pauses the bot's hands. Null when there is no desktop app. */
+function browserIntegration(botId: string) {
+  const connection = readBrowserConnection();
+  if (!connection) return null;
+  const control = controlIntegration(botId);
+  return {
+    connection,
+    integration: {
+      command: process.execPath,
+      args: [SPAWNED_PROXIES.browser],
+      env: {
+        ...AGENTS_NODE_FLAG,
+        OMB_BROWSER_URL: connection.url,
+        OMB_BROWSER_TOKEN: connection.token,
+        OMB_BOT_ID: botId,
+        OMB_CONTROL_URL: control.url,
+        OMB_CONTROL_TOKEN: control.token,
+      },
     },
   };
 }
@@ -1076,7 +1102,7 @@ bus.subscribe((event: RuntimeEvent) => {
         // computer tools can change the screen, and each capture competes
         // with the agent for the box's command endpoint, so a bot grinding
         // through file edits must not trigger one per tool.
-        if (bot && /computer|screenshot|click|type_text|press_key|scroll|open_url/i.test(toolName)) {
+        if (bot && /computer|screenshot|click|type_text|press_key|scroll|open_url|browser_/i.test(toolName)) {
           pokeScreenPoller(bot.id);
         }
       }
@@ -1794,6 +1820,12 @@ async function startTurn(
       if (selectedSkills.some((skill) => skill.manifest.requiredCapabilities.includes("phoneMcp"))) {
         integrations.phone = phoneIntegration();
       }
+      // the built-in browser: per-bot opt-in, and only to a driver that can
+      // mount it, and only while the desktop app is running its host
+      const browser = bot.browser === true && instance.adapter.capabilities.browserMcp === true
+        ? browserIntegration(bot.id)
+        : null;
+      if (browser) integrations.browser = browser.integration;
       // the user's connected apps, but only to a driver that can mount
       // them — a key in the config says the connections exist, not that
       // this engine can reach them — and only to a bot the user has not
@@ -2076,6 +2108,9 @@ async function startTurn(
           (integrations.composio
             ? " The user's connected apps (Gmail, Calendar, Slack, Notion, and the rest) are reachable through the composio tools — find the right one with COMPOSIO_SEARCH_TOOLS, read its arguments with COMPOSIO_GET_TOOL_SCHEMAS, then run it with COMPOSIO_MULTI_EXECUTE_TOOL. Reach for them before telling the user you have no access to a service."
             : "") +
+          (integrations.browser
+            ? " You have your own built-in web browser through the browser tools: browser_navigate opens a page and browser_snapshot lists its interactive elements as refs; browser_click and browser_fill act on a ref; browser_screenshot shows the page when the element list isn't enough. Every browser action already returns the resulting page, so don't follow it with browser_snapshot. The user watches the same page in the Browser panel and can take over at any time. At a sign-in, password, MFA, CAPTCHA, or payment step, stop and ask the user to complete it in the Browser panel; never type their password or a one-time code."
+            : "") +
           (coordinationPrompt ? ` ${coordinationPrompt}` : "") +
           credentialPrompt +
           routinePrompt +
@@ -2102,6 +2137,10 @@ async function startTurn(
       // after its own turn.completed would never be torn down — it would
       // keep polling the box forever, carrying dead per-turn state. busy
       // is flipped false in the fold, so it is the honest "still running".
+      if (!previewCapture && browser) {
+        const connection = browser.connection;
+        previewCapture = () => browserScreenshot(connection, bot.id);
+      }
       if (previewCapture && store.bot(bot.id)?.busy) {
         startScreenPoller(bot.id, previewCapture, { screenIsTheWork: instance.driverKind === "boxAgent" });
       }
@@ -2432,6 +2471,10 @@ async function runGroupMemberTurn(
   );
   if (selectedSkills.some((skill) => skill.manifest.requiredCapabilities.includes("phoneMcp"))) {
     integrations.phone = phoneIntegration();
+  }
+  if (bot.browser === true && instance.adapter.capabilities.browserMcp === true) {
+    const browser = browserIntegration(bot.id);
+    if (browser) integrations.browser = browser.integration;
   }
   try {
     if (bot.composio !== false && composio.configured(cfg) && instance.adapter.capabilities.composioMcp === true) {
@@ -4822,6 +4865,11 @@ const server = createServer(async (req, res) => {
       if (body.composio !== undefined) {
         if (typeof body.composio !== "boolean") return json(res, 400, { error: "composio must be true or false" });
         patch.composio = body.composio;
+      }
+      // per-bot gate on the app's built-in browser
+      if (body.browser !== undefined) {
+        if (typeof body.browser !== "boolean") return json(res, 400, { error: "browser must be true or false" });
+        patch.browser = body.browser;
       }
       if (
         body.computer !== undefined &&

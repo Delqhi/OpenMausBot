@@ -57,6 +57,9 @@ const { createDisplayMediaGuard, invokeDisplayMediaCallback, selectCaptureSource
 const { STAGE_PREFIX: APPIMAGE_CUA_STAGE_PREFIX } = require("./cua-linux-bundle.cjs");
 const { desktopViewerUrl, sameDesktopViewerOrigin } = require("./desktop-viewer.cjs");
 const { createDesktopWorkspaceManager } = require("./desktop-workspace.cjs");
+const { createBrowserSurfaceManager } = require("./browser-surface.cjs");
+const { createBrowserHost } = require("./browser-host.cjs");
+const { createCuaConnectionStore: createDescriptorStore } = require("./cua-connection.cjs");
 const { normalizeUnreadCount, parseWindowState, resolveWindowState } = require("./window-state.cjs");
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -71,6 +74,15 @@ let desktopViewerOwner = null;
 let desktopViewerContextId = null;
 let desktopWorkspaceManager = null;
 let desktopWorkspaceOwner = null;
+// The built-in browser surface (Browser tab of the computer panel): views
+// live in this process; bots reach them through the loopback host whose
+// address and per-boot token the descriptor file hands to the harness.
+let browserSurface = null;
+let browserHost = null;
+const browserConnectionStore = createDescriptorStore({
+  getUserData: () => app.getPath("userData"),
+  fileName: "browser-connection.json",
+});
 let pendingPackageInstallUrl = packageUrlFromCommandLine(process.argv);
 let mainWindow = null;
 // The active skin id, mirrored from the renderer so a window's native
@@ -992,6 +1004,62 @@ function desktopWorkspaceForEvent(event, create = false) {
   return create ? ensureDesktopWorkspace(owner) : desktopWorkspaceManager;
 }
 
+/** The built-in browser: one WebContentsView per bot inside the app window,
+ * plus the loopback host the bot's tools call. Never blocks the window —
+ * without it the Browser tab simply reports itself unavailable. */
+async function startBrowserSurface(owner) {
+  try {
+    browserSurface = createBrowserSurfaceManager({
+      owner,
+      createView: (options) => new WebContentsView(options),
+      notify: (state) => {
+        if (!owner.isDestroyed() && !owner.webContents.isDestroyed()) owner.webContents.send("browser:state", state);
+      },
+    });
+    browserHost = createBrowserHost({ manager: browserSurface });
+    await browserHost.start();
+    browserConnectionStore.persist(browserHost.descriptor());
+    // A renderer reload or crash loses the panel that positioned the views;
+    // hide them until a mounted Browser tab lays them out again. The pages
+    // themselves stay alive — a bot mid-task must not lose its tab.
+    owner.webContents.on("did-start-navigation", (_event, _url, isInPlace, isMainFrame) => {
+      if (isMainFrame && !isInPlace) browserSurface?.hideAll();
+    });
+    owner.webContents.on("render-process-gone", () => browserSurface?.hideAll());
+    owner.once("closed", () => {
+      browserSurface?.closeAll();
+      browserSurface = null;
+    });
+    slog(`browser surface listening at ${browserHost.url}`);
+  } catch (error) {
+    slog(`browser surface unavailable: ${error?.message ?? error}`);
+    browserSurface = null;
+    browserHost = null;
+  }
+}
+
+function browserSurfaceForEvent(event) {
+  const owner = mainWindow;
+  if (!owner || owner.isDestroyed() || event.sender !== owner.webContents) {
+    throw new Error("The browser is available only to the main app window");
+  }
+  if (!browserSurface) throw new Error("The built-in browser is unavailable");
+  return browserSurface;
+}
+
+ipcMain.handle("browser:available", () => Boolean(browserSurface && browserHost?.url));
+ipcMain.handle("browser:state", (event, botId) => browserSurfaceForEvent(event).state(botId));
+ipcMain.handle("browser:layout", (event, botId, bounds) => browserSurfaceForEvent(event).layout(botId, bounds ?? null));
+ipcMain.handle("browser:navigate", async (event, botId, url) => {
+  const result = await browserSurfaceForEvent(event).navigate(botId, url);
+  return { url: result.url, title: result.title };
+});
+ipcMain.handle("browser:back", async (event, botId) => {
+  const result = await browserSurfaceForEvent(event).back(botId);
+  return { url: result.url, title: result.title };
+});
+ipcMain.handle("browser:close", (event, botId) => browserSurfaceForEvent(event).close(botId));
+
 ipcMain.on("screen:preview-intent", (event) => {
   event.returnValue = displayMediaGuard.begin(event.senderFrame);
 });
@@ -1682,6 +1750,7 @@ app.whenReady().then(async () => {
     void startDesktopCompanion({ waitForHosted: false, remember: false });
   }
   const win = createWindow();
+  await startBrowserSurface(win);
   // Reconcile incomplete setup and resume interrupted sign-out only after the
   // local app is usable. This background network work never gates LAN pairing
   // or the first window.
@@ -1753,9 +1822,13 @@ app.on("before-quit", (e) => {
   // stop it here so quitting never orphans a recording process
   if (nativeActions.appleSpeech) stopSpeech();
   stopRecorder();
+  try {
+    browserSurface?.closeAll();
+  } catch {}
   const cleanup = Promise.race([
     Promise.all([
       stopCua().catch(() => {}),
+      browserHost?.stop().catch(() => {}) ?? Promise.resolve(),
       // Both listeners reachable from outside the app are owned children.
       // Shut the connector down first, then the sidecar, without changing the
       // remembered toggle the next launch will restore.

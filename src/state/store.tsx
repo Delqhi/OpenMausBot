@@ -238,6 +238,8 @@ export interface Bot {
   /** Whether this bot may use the workspace's connected apps. Unset means
    * allowed for existing bots; imported bots start with this disabled. */
   composio?: boolean;
+  /** Whether this bot gets the app's built-in browser (Browser tab). Off by default. */
+  browser?: boolean;
   messages: Message[];
   /** leaf of the visible conversation branch (see visibleMessages) */
   activeLeafId?: string | null;
@@ -340,6 +342,7 @@ export interface InstanceInfo {
     computerMcp?: boolean;
     agentsMcp?: boolean;
     composioMcp?: boolean;
+    browserMcp?: boolean;
     images?: boolean;
     effortLevels?: readonly EffortLevel[];
     /** the engine keeps a live session and takes a message mid-turn */
