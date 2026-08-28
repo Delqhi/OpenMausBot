@@ -47,9 +47,27 @@ function elementForRef(ref: string): Element | null {
   return last?.info.get(ref)?.element ?? null;
 }
 
+/** Two presented frames, or a short wait when the view is throttled (an
+ * occluded or unfocused view may never run requestAnimationFrame). */
+const nextFrames = (count: number, maxMs = 150): Promise<void> =>
+  new Promise((resolve) => {
+    let done = false;
+    const finish = () => {
+      if (!done) {
+        done = true;
+        resolve();
+      }
+    };
+    const tick = (left: number) => (left <= 0 ? finish() : requestAnimationFrame(() => tick(left - 1)));
+    tick(count);
+    setTimeout(finish, maxMs);
+  });
+
 /** Where a ref is on screen right now. Scrolls it into view first, the
- * same way a person would before clicking. */
-function boxForRef(ref: string): BoxResult {
+ * same way a person would before clicking, then lets the compositor catch
+ * up: synthetic input is hit-tested against the last presented frame, so a
+ * click dispatched in the same task as the scroll lands on stale pixels. */
+async function boxForRef(ref: string): Promise<BoxResult> {
   const element = elementForRef(ref);
   if (!element) return { found: false };
   if (!element.isConnected) return { found: true, connected: false };
@@ -58,6 +76,7 @@ function boxForRef(ref: string): BoxResult {
   } catch {
     // some elements refuse; the rect below is still the truth
   }
+  await nextFrames(2);
   const rect = element.getBoundingClientRect();
   const visible = rect.width > 0 && rect.height > 0 && rect.bottom > 0 && rect.right > 0 && rect.top < window.innerHeight && rect.left < window.innerWidth;
   return {

@@ -58,6 +58,7 @@ const { STAGE_PREFIX: APPIMAGE_CUA_STAGE_PREFIX } = require("./cua-linux-bundle.
 const { desktopViewerUrl, sameDesktopViewerOrigin } = require("./desktop-viewer.cjs");
 const { createDesktopWorkspaceManager } = require("./desktop-workspace.cjs");
 const { createBrowserSurfaceManager } = require("./browser-surface.cjs");
+const { browserProfilePartition } = require("./browser-snapshot.cjs");
 const { createBrowserHost } = require("./browser-host.cjs");
 const { createCuaConnectionStore: createDescriptorStore } = require("./cua-connection.cjs");
 const { normalizeUnreadCount, parseWindowState, resolveWindowState } = require("./window-state.cjs");
@@ -1075,6 +1076,26 @@ ipcMain.handle("browser:back", async (event, botId) => {
   return { url: result.url, title: result.title };
 });
 ipcMain.handle("browser:close", (event, botId) => browserSurfaceForEvent(event).close(botId));
+// Deleting a profile: every bot's view on it goes, then its cookies, storage
+// and cache. The partition directory itself is left for Chromium to reuse
+// (removing it while the session object lives is the EBUSY trap every
+// Electron app with profiles has hit); nothing identifying remains in it.
+ipcMain.handle("browser:forget-profile", async (event, profileId) => {
+  const surface = browserSurfaceForEvent(event);
+  const id = String(profileId ?? "");
+  if (!/^[A-Za-z0-9_-]{1,40}$/.test(id) || id === "guest") throw new Error("That browser profile id is invalid");
+  const dropped = surface.forgetProfile(id);
+  const ses = session.fromPartition(browserProfilePartition(id));
+  await ses.clearStorageData();
+  await ses.clearCache();
+  try {
+    await ses.clearAuthCache();
+  } catch {}
+  try {
+    ses.closeAllConnections();
+  } catch {}
+  return { dropped };
+});
 
 ipcMain.on("screen:preview-intent", (event) => {
   event.returnValue = displayMediaGuard.begin(event.senderFrame);

@@ -219,6 +219,7 @@ type SkillRecordingPayload = {
         navigate(botId: string, url: string): Promise<{ url: string; title: string }>;
         back(botId: string): Promise<{ url: string; title: string }>;
         forward?(botId: string): Promise<{ url: string; title: string }>;
+        forgetProfile?(profileId: string): Promise<{ dropped: number }>;
         close(botId: string): Promise<boolean>;
         onState(cb: (state: BrowserSurfaceState) => void): () => void;
       };

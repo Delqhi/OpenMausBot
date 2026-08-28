@@ -365,6 +365,11 @@ function createBrowserSurfaceManager({
         await dbg.sendCommand("Page.enable");
         // never show a native file picker for a bot; the event is reported instead
         await dbg.sendCommand("Page.setInterceptFileChooserDialog", { enabled: true });
+        // Chromium drops synthetic mouse input for a widget that is not
+        // focused — and a child view is not focused while the person types
+        // in the chat, or while another app is in front. Playwright makes
+        // every page believe it has focus for exactly this reason.
+        await dbg.sendCommand("Emulation.setFocusEmulationEnabled", { enabled: true });
       } catch {
         // an older protocol without these is still usable for input
       }
@@ -804,6 +809,20 @@ function createBrowserSurfaceManager({
       const size = image.getSize();
       const scaled = size.width > SCREENSHOT_WIDTH ? image.resize({ width: SCREENSHOT_WIDTH }) : image;
       return { png: scaled.toJPEG(SCREENSHOT_QUALITY).toString("base64"), format: "jpeg", width: scaled.getSize().width, height: scaled.getSize().height };
+    },
+
+    /** Drop every bot's view on a named profile — before its data is cleared. */
+    forgetProfile(profileId) {
+      const wanted = String(profileId ?? "");
+      if (!wanted || wanted === GUEST_PROFILE) return 0;
+      let dropped = 0;
+      for (const entry of [...entries.values()]) {
+        if (entry.profile === wanted) {
+          remove(entry, "profile-deleted");
+          dropped += 1;
+        }
+      }
+      return dropped;
     },
 
     /** Drop every view a bot has (all profiles). */

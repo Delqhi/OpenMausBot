@@ -7,7 +7,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
-import { formatObserved } from "./browser-proxy.ts";
+import { classifyWall, formatObserved } from "./browser-proxy.ts";
 
 const PROXY = join(dirname(fileURLToPath(import.meta.url)), "browser-proxy.ts");
 const TOKEN = "b".repeat(64);
@@ -16,6 +16,8 @@ const CONTROL_TOKEN = "control-token";
 let stub: Server;
 let stubPort = 0;
 let held = false;
+let helpOpen = false;
+const helpRequests: Array<{ method: string; body: Record<string, unknown> }> = [];
 const hits: Array<{ path: string; auth: string | undefined; body: Record<string, unknown> }> = [];
 let child: ChildProcess;
 const pending = new Map<number, (msg: any) => void>();
@@ -51,7 +53,17 @@ beforeAll(async () => {
       const path = req.url ?? "";
       if (path === "/control") {
         res.writeHead(200, { "content-type": "application/json" });
-        return res.end(JSON.stringify({ held, helpOpen: false }));
+        if (req.method === "POST") {
+          helpRequests.push({ method: "POST", body: raw ? JSON.parse(raw) : {} });
+          helpOpen = true;
+          return res.end(JSON.stringify({ requestId: "help-1" }));
+        }
+        if (req.method === "DELETE") {
+          helpRequests.push({ method: "DELETE", body: raw ? JSON.parse(raw) : {} });
+          helpOpen = false;
+          return res.end(JSON.stringify({ ok: true }));
+        }
+        return res.end(JSON.stringify({ held, helpOpen }));
       }
       const body = raw ? JSON.parse(raw) : {};
       hits.push({ path, auth: req.headers.authorization, body });
@@ -124,6 +136,7 @@ describe("browser MCP proxy", () => {
       "browser_read",
       "browser_back",
       "browser_forward",
+      "browser_request_takeover",
       "browser_state",
       "browser_screenshot",
     ]);
@@ -197,6 +210,46 @@ describe("browser MCP proxy", () => {
     const look = await callTool("browser_snapshot", {});
     expect(look.result.isError).toBeFalsy();
     held = false;
+  });
+});
+
+describe("browser takeover", () => {
+  it("pages the user, waits for the hand-back, and returns the page as it is afterwards", async () => {
+    held = false;
+    helpOpen = false;
+    helpRequests.length = 0;
+    const pending = callTool("browser_request_takeover", { reason: "Please sign in to GitHub" });
+    // the person takes the wheel, then hands it back — the plea is closed by the app
+    await new Promise((resolve) => setTimeout(resolve, 900));
+    expect(helpRequests[0]).toEqual({ method: "POST", body: { reason: "Please sign in to GitHub" } });
+    held = true;
+    await new Promise((resolve) => setTimeout(resolve, 1700));
+    held = false;
+    helpOpen = false;
+    const res = await pending;
+    expect(res.result.isError).toBeFalsy();
+    expect(text(res)).toMatch(/handed control back/);
+    expect(text(res)).toContain('b1 link "Home"');
+    const missing = await callTool("browser_request_takeover", {});
+    expect(missing.result.isError).toBe(true);
+  }, 20_000);
+});
+
+describe("classifyWall", () => {
+  it("recognises sign-in and verification pages without flagging ordinary ones", () => {
+    expect(classifyWall({ url: "https://github.com/login", title: "Sign in to GitHub", yaml: '- textbox "Password" [ref=e3]' })).toBe("sign-in");
+    expect(classifyWall({ url: "https://accounts.google.com/v3/signin/identifier", title: "Google", yaml: "" })).toBe("sign-in");
+    expect(classifyWall({ url: "https://shop.example/account", title: "Account", yaml: '- textbox "One-time code" [ref=e2]' })).toBe("sign-in");
+    expect(classifyWall({ url: "https://shop.example/", title: "Just a moment...", yaml: "" })).toBe("verification");
+    expect(classifyWall({ url: "https://shop.example/", title: "Shop", yaml: "- generic: Verify you are human" })).toBe("verification");
+    expect(classifyWall({ url: "https://news.example/login-tips", title: "Ten login tips", yaml: '- link "Read more" [ref=e1]' })).toBeNull();
+    expect(classifyWall({ url: "https://shop.example/cart", title: "Cart", elements: [{ ref: "b1", role: "button", name: "Checkout" }] })).toBeNull();
+  });
+
+  it("adds the takeover instruction to an observed wall page", () => {
+    const rendered = formatObserved({ url: "https://github.com/login", title: "Sign in to GitHub", elements: [], yaml: '- textbox "Password" [ref=e3]' });
+    expect(rendered).toContain("call browser_request_takeover");
+    expect(rendered).toContain("Never type the user's password");
   });
 });
 

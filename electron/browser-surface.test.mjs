@@ -202,8 +202,9 @@ describe("browser surface manager", () => {
     expect(page.text).toContain('b11 link "Docs"');
     expect(page.text).toContain("1600px below");
     expect(views[0].calls).toContainEqual(["attach", "1.3"]);
-    // attaching also enables Page events and intercepts native file pickers
-    expect(cdpCalls(views[0]).slice(0, 2).map(([name]) => name)).toEqual(["Page.enable", "Page.setInterceptFileChooserDialog"]);
+    // attaching also enables Page events, intercepts native file pickers, and
+    // makes the page believe it is focused so synthetic clicks are not dropped
+    expect(cdpCalls(views[0]).slice(0, 3).map(([name]) => name)).toEqual(["Page.enable", "Page.setInterceptFileChooserDialog", "Emulation.setFocusEmulationEnabled"]);
   });
 
   it("keeps one live view per profile and switches by showing another, never rebuilding", async () => {
@@ -374,6 +375,19 @@ describe("browser surface manager", () => {
     const fallback = await bare.manager.navigate("bot-a", "https://example.com");
     expect(fallback.yaml).toBeNull();
     expect(fallback.elements.map((element) => element.ref)).toEqual(["b11", "b12", "b13"]);
+  });
+
+  it("drops every bot's view on a deleted profile and leaves other sessions alone", () => {
+    const { manager, views } = harness();
+    manager.layout("bot-a", BOUNDS, "work", "compact");
+    manager.layout("bot-b", BOUNDS, "work", "compact");
+    manager.layout("bot-c", BOUNDS, "", "compact");
+    expect(manager.forgetProfile("work")).toBe(2);
+    expect(manager.size()).toBe(1);
+    expect(views[2].calls.some(([name]) => name === "close")).toBe(false);
+    expect(manager.state("bot-a")).toMatchObject({ open: false });
+    expect(manager.forgetProfile(GUEST_PROFILE)).toBe(0);
+    expect(manager.forgetProfile("")).toBe(0);
   });
 
   it("tears every view down on closeAll and hides them all on hideAll", async () => {

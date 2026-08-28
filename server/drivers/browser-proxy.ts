@@ -84,13 +84,53 @@ const rpcMessageSchema = z.object({
   params: z.object({ name: z.string().optional(), arguments: z.unknown().optional(), protocolVersion: z.string().optional() }).optional(),
 });
 
+// ── sign-in and verification walls ──────────────────────────────────────
+// The bot must never type a password or solve a challenge; the person does
+// that in the Browser panel and hands control back. Detection is a hint on
+// the observed page, not a gate: a login form embedded in a page the bot can
+// still use stays usable.
+const WALL_URL = /(^|[./])(login|signin|sign-in|sign_in|log-in|auth|sso|oauth|authorize|mfa|2fa|otp|verify|challenge|captcha|checkpoint)([./?#]|$)/i;
+const WALL_HOST = /(accounts\.google\.com|login\.microsoftonline\.com|appleid\.apple\.com|auth0\.com|okta\.com|challenges\.cloudflare\.com)/i;
+/** A title that IS the sign-in step, not one that mentions logging in. */
+const WALL_TITLE = /^(sign in|sign-in|log in|log-in|login|signin|verify|verification|two-factor|2-step|authenticate)\b/i;
+const WALL_BODY = /textbox "?[^"\n]*(password|passcode|one-time|verification code|security code)|(hcaptcha|recaptcha|turnstile|cf-challenge|press and hold|verify you are human)/i;
+
+export type WallKind = "sign-in" | "verification";
+
+/** Does this page want something only the person can give? */
+export function classifyWall(page: { url: string; title: string; yaml?: string | null; elements?: ObservedElement[] }): WallKind | null {
+  const body = page.yaml ?? (page.elements ?? []).map((element) => `${element.role} "${element.name}"`).join("\n");
+  let host = "";
+  try {
+    host = new URL(page.url).host;
+  } catch {
+    host = "";
+  }
+  const verification = /(just a moment|verify you are human|attention required|are you a robot|security check|checking your browser|captcha)/i.test(page.title)
+    || /(hcaptcha|recaptcha|turnstile|cf-challenge|press and hold|verify you are human)/i.test(body)
+    || /challenges\.cloudflare\.com/i.test(host);
+  if (verification) return "verification";
+  // a password/one-time-code field anywhere is the strongest signal; a
+  // sign-in host, or a sign-in URL whose title says so, are the others
+  const signIn = WALL_BODY.test(body) || WALL_HOST.test(host) || (WALL_URL.test(page.url) && WALL_TITLE.test(page.title.trim()));
+  return signIn ? "sign-in" : null;
+}
+
+function wallNote(kind: WallKind): string {
+  return kind === "verification"
+    ? "This looks like a bot check or verification page. Do not try to solve it: call browser_request_takeover so the user can complete it in the Browser panel, then continue from the page you get back."
+    : "This looks like a sign-in step. Never type the user's password or a one-time code: call browser_request_takeover so they can sign in in the Browser panel, then continue from the page you get back.";
+}
+
 /** The page as the model reads it. URLs are scrubbed of query and fragment
  * before they reach a transcript (session tokens ride in both); the host
  * keeps the real one. */
 export function formatObserved(page: ObservedPage): string {
   const url = safeBrowserUrl(page.url) ?? (page.url === "about:blank" ? "about:blank" : "URL unavailable");
+  const wall = classifyWall(page);
+  const notes = [...(page.notes ?? []), ...(wall ? [wallNote(wall)] : [])];
   if (page.yaml !== undefined && page.yaml !== null) {
-    return [`Browser — ${page.title || "Untitled"}: ${url}`, page.yaml || "(empty page)", ...(page.notes ?? [])].join("\n");
+    return [`Browser — ${page.title || "Untitled"}: ${url}`, page.yaml || "(empty page)", ...notes].join("\n");
   }
   const lines = page.elements.map((element) => {
     const flags = [
@@ -100,7 +140,7 @@ export function formatObserved(page: ObservedPage): string {
     ].filter(Boolean);
     return `${element.ref} ${element.role} ${JSON.stringify(element.name)}${flags.length ? ` (${flags.join(", ")})` : ""}`;
   });
-  return [`Browser — ${page.title || "Untitled"}: ${url}`, lines.join("\n") || "No interactive elements found.", ...(page.notes ?? [])].join("\n");
+  return [`Browser — ${page.title || "Untitled"}: ${url}`, lines.join("\n") || "No interactive elements found.", ...notes].join("\n");
 }
 
 export type HostRequest = (operation: string, body?: object) => Promise<unknown>;
@@ -227,6 +267,16 @@ export const TOOLS = [
     inputSchema: { type: "object", properties: {} },
   },
   {
+    name: "browser_request_takeover",
+    description:
+      "Ask the user to take over the browser for a sign-in, password, one-time code, CAPTCHA, or any step you must not do yourself, then wait until they hand control back. Returns the page as it is afterwards. Never enter credentials or solve challenges yourself.",
+    inputSchema: {
+      type: "object",
+      properties: { reason: { type: "string", maxLength: 240, description: "One short sentence: what you need them to do." } },
+      required: ["reason"],
+    },
+  },
+  {
     name: "browser_state",
     description: "The current page's title and address, without elements. Cheap; use it to confirm where you are.",
     inputSchema: { type: "object", properties: {} },
@@ -252,6 +302,40 @@ function argumentError(tool: string, error: z.ZodError): ToolResult {
   const issue = error.issues[0];
   const where = issue?.path.length ? ` (${issue.path.join(".")})` : "";
   return textResult(`${tool}: ${issue?.message ?? "invalid arguments"}${where}`, true);
+}
+
+const TAKEOVER_WAIT_MS = 10 * 60_000;
+const TAKEOVER_POLL_MS = 1_500;
+const takeoverArgs = z.object({ reason: z.string().trim().min(1, "say what the user should do").max(240) });
+
+/** Page the person, then wait for the hand-back — the same choreography the
+ * computer proxy uses. Reads stay allowed meanwhile; actions refuse. */
+async function requestTakeover(reason: string, request: HostRequest, waitMs = TAKEOVER_WAIT_MS, pollMs = TAKEOVER_POLL_MS): Promise<ToolResult> {
+  if (!control.configured) {
+    return textResult("Nobody can be paged for this browser right now. Tell the user in chat what you need them to do in the Browser panel.", true);
+  }
+  const initial = await control.state(true);
+  // if the person is already driving, don't clobber whatever plea they are reading
+  const requestId = initial.held ? null : await control.requestHelp(reason);
+  if (!initial.held && requestId === null) {
+    return textResult("The user could not be paged right now. Tell them in chat what you need them to do in the Browser panel.", true);
+  }
+  let sawHold = initial.held;
+  const deadline = Date.now() + waitMs;
+  while (Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, pollMs));
+    const state = await control.state(true);
+    if (state.held) sawHold = true;
+    if (!state.held && !state.helpOpen) {
+      const page = await observed(request, "snapshot");
+      const lead = sawHold
+        ? "The user has finished and handed control back. Here is the page as it is now — continue from it, and never repeat what they did."
+        : "The user dismissed the request without taking control. Carry on yourself if you can, or ask them in chat.";
+      return { content: [{ type: "text", text: `${lead}\n\n${page.content[0]?.type === "text" ? page.content[0].text : ""}` }] };
+    }
+  }
+  if (requestId) await control.expireHelp(requestId);
+  return textResult("Nobody took control within the wait window. Tell the user in chat what you need, then try again when they are ready.", true);
 }
 
 const ACTS = new Set([
@@ -340,6 +424,11 @@ export async function callTool(name: string, args: unknown, request: HostRequest
   }
   if (name === "browser_back") return observed(request, "back");
   if (name === "browser_forward") return observed(request, "forward");
+  if (name === "browser_request_takeover") {
+    const parsed = takeoverArgs.safeParse(args);
+    if (!parsed.success) return argumentError(name, parsed.error);
+    return requestTakeover(parsed.data.reason, request);
+  }
   if (name === "browser_state") {
     const state = stateSchema.parse(await request("state"));
     if (!state.url || state.url === "about:blank") return textResult("The browser tab is empty. Use browser_navigate to open a page.");

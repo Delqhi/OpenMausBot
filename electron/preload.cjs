@@ -162,6 +162,8 @@ contextBridge.exposeInMainWorld("ogb", {
     navigate: (botId, url) => ipcRenderer.invoke("browser:navigate", botId, url),
     back: (botId) => ipcRenderer.invoke("browser:back", botId),
     forward: (botId) => ipcRenderer.invoke("browser:forward", botId),
+    /** Wipe a named profile's logins, storage and cache after it is deleted. */
+    forgetProfile: (profileId) => ipcRenderer.invoke("browser:forget-profile", profileId),
     close: (botId) => ipcRenderer.invoke("browser:close", botId),
     onState: (cb) => {
       const handler = (_event, state) => cb(state);
