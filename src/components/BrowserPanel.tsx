@@ -14,6 +14,7 @@ type ControlSnapshot = { held: boolean; helpReason: string | null };
 
 const NATIVE_VIEW_OVERLAY_SELECTOR = '[aria-modal="true"], [role="dialog"], [role="menu"], [popover], [data-native-view-overlay]';
 const OWN_PROFILE = "";
+const GUEST_PROFILE = "guest";
 const NEW_PROFILE = "__new__";
 
 async function api(path: string, init?: RequestInit): Promise<any> {
@@ -94,8 +95,14 @@ export function BrowserPanel({
   const [profileBusy, setProfileBusy] = useState(false);
   const botId = bot.id;
   const profiles = state.config?.browserProfiles ?? [];
-  // a profile that was deleted falls back to the bot's own session
-  const activeProfile = bot.browserProfile && profiles.some((profile) => profile.id === bot.browserProfile) ? bot.browserProfile : OWN_PROFILE;
+  // a profile that was deleted falls back to the bot's own session; Guest is
+  // never in the list, it is a throwaway the surface forgets on switch-away
+  const activeProfile =
+    bot.browserProfile === GUEST_PROFILE
+      ? GUEST_PROFILE
+      : bot.browserProfile && profiles.some((profile) => profile.id === bot.browserProfile)
+        ? bot.browserProfile
+        : OWN_PROFILE;
 
   // Layout: tell main where the tab's rectangle is, on every change that can
   // move it (resize, scroll, sidebar toggles, dialogs). Coalesced per frame.
@@ -109,7 +116,7 @@ export function BrowserPanel({
       const bounds = elementBounds(hostRef.current);
       const target = bounds && pageVisible && !overlayIntersects(bounds) ? bounds : null;
       bridge
-        .layout(botId, target, activeProfile)
+        .layout(botId, target, activeProfile, size)
         .then((next) => {
           if (alive) setSurface(next);
         })
@@ -142,7 +149,7 @@ export function BrowserPanel({
       // but nothing may paint over the chat.
       void bridge.layout(botId, null).catch(() => {});
     };
-  }, [bridge, botId, pageVisible, activeProfile]);
+  }, [bridge, botId, pageVisible, activeProfile, size]);
 
   useEffect(() => {
     if (!bridge) return;
@@ -350,6 +357,7 @@ export function BrowserPanel({
                   {profile.name}
                 </option>
               ))}
+              <option value={GUEST_PROFILE}>Guest (forgets everything)</option>
               <option value={NEW_PROFILE}>+ Add profile…</option>
             </select>
           </div>
@@ -400,7 +408,7 @@ export function BrowserPanel({
           </form>
         )}
         <div className="mt-1.5 text-[11.5px] leading-relaxed text-ink-secondary">
-          A profile is its own set of logins and cookies. Bots pointed at the same profile share it; "{bot.name}'s own" is private to this bot.
+          A profile is its own set of logins and cookies — sign in once and it stays. Bots pointed at the same profile share it; "{bot.name}'s own" is private to this bot; Guest is thrown away when you switch off it.
         </div>
       </div>
       {error && <div className="mt-2 text-[12px] text-danger">{error}</div>}

@@ -43,13 +43,15 @@ const pageSchema = z.object({
   url: z.string().default(""),
   title: z.string().default(""),
   elements: z.array(elementSchema).default([]),
+  /** what the surface did or noticed on the bot's behalf: answered dialogs, off-screen content */
+  notes: z.array(z.string()).default([]),
 });
 const stateSchema = z.object({ url: z.string().default(""), title: z.string().default(""), loading: z.boolean().optional() });
 const screenshotSchema = z.object({ png: z.string().min(1), format: z.string().optional() });
 const hostErrorSchema = z.object({ error: z.string().min(1) });
 
 export type ObservedElement = z.infer<typeof elementSchema>;
-export type ObservedPage = z.infer<typeof pageSchema>;
+export type ObservedPage = Omit<z.infer<typeof pageSchema>, "notes"> & { notes?: string[] };
 
 // ── what the model sends ─────────────────────────────────────────────────
 const refSchema = z.string().trim().min(1, "a ref from browser_snapshot is required");
@@ -62,6 +64,18 @@ const scrollArgs = z.object({
   direction: z.enum(["up", "down", "left", "right"]).default("down"),
   amount: z.number().int().min(1).max(5_000).optional(),
 });
+const hoverArgs = z.object({ ref: refSchema });
+const dragArgs = z.object({ from: refSchema, to: refSchema });
+const selectArgs = z.object({
+  ref: refSchema,
+  values: z.union([z.string().min(1), z.array(z.string().min(1)).min(1)]),
+});
+const waitArgs = z.object({
+  text: z.string().trim().min(1).optional(),
+  url: z.string().trim().min(1).optional(),
+  timeout_ms: z.number().int().min(250).max(30_000).optional(),
+});
+const readSchema = z.object({ url: z.string().default(""), title: z.string().default(""), text: z.string().default(""), truncated: z.boolean().optional() });
 const rpcMessageSchema = z.object({
   id: z.unknown().optional(),
   method: z.string().optional(),
@@ -81,7 +95,7 @@ export function formatObserved(page: ObservedPage): string {
     ].filter(Boolean);
     return `${element.ref} ${element.role} ${JSON.stringify(element.name)}${flags.length ? ` (${flags.join(", ")})` : ""}`;
   });
-  return `Browser — ${page.title || "Untitled"}: ${url}\n${lines.join("\n") || "No interactive elements found."}`;
+  return [`Browser — ${page.title || "Untitled"}: ${url}`, lines.join("\n") || "No interactive elements found.", ...(page.notes ?? [])].join("\n");
 }
 
 export type HostRequest = (operation: string, body?: object) => Promise<unknown>;
@@ -157,8 +171,54 @@ export const TOOLS = [
     },
   },
   {
+    name: "browser_hover",
+    description: "Move the pointer over one element ref (opens hover menus, reveals tooltips). Returns the page.",
+    inputSchema: { type: "object", properties: { ref: REF_PROPERTY }, required: ["ref"] },
+  },
+  {
+    name: "browser_drag",
+    description: "Drag one element ref onto another.",
+    inputSchema: { type: "object", properties: { from: REF_PROPERTY, to: REF_PROPERTY }, required: ["from", "to"] },
+  },
+  {
+    name: "browser_select_option",
+    description: "Choose one or more options in a select (dropdown) field ref, by option value or visible label.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        ref: REF_PROPERTY,
+        values: { type: "array", items: { type: "string" }, minItems: 1, description: "Option values or labels; several only for a multi-select." },
+      },
+      required: ["ref", "values"],
+    },
+  },
+  {
+    name: "browser_wait_for",
+    description:
+      "Wait until text appears on the page and/or the address contains something, then return the page. With neither, just waits for the page to settle. Bounded by timeout_ms (default 10000, max 30000).",
+    inputSchema: {
+      type: "object",
+      properties: {
+        text: { type: "string", description: "Visible text to wait for." },
+        url: { type: "string", description: "A substring the address must contain." },
+        timeout_ms: { type: "integer", minimum: 250, maximum: 30000 },
+      },
+    },
+  },
+  {
+    name: "browser_read",
+    description:
+      "Read the page's visible text (articles, results, tables) as plain text — for understanding content, not for acting. Use browser_snapshot for things to click.",
+    inputSchema: { type: "object", properties: {} },
+  },
+  {
     name: "browser_back",
     description: "Go back to the previous page.",
+    inputSchema: { type: "object", properties: {} },
+  },
+  {
+    name: "browser_forward",
+    description: "Go forward to the next page.",
     inputSchema: { type: "object", properties: {} },
   },
   {
@@ -189,7 +249,19 @@ function argumentError(tool: string, error: z.ZodError): ToolResult {
   return textResult(`${tool}: ${issue?.message ?? "invalid arguments"}${where}`, true);
 }
 
-const ACTS = new Set(["browser_navigate", "browser_click", "browser_fill", "browser_type", "browser_press", "browser_scroll", "browser_back"]);
+const ACTS = new Set([
+  "browser_navigate",
+  "browser_click",
+  "browser_hover",
+  "browser_drag",
+  "browser_fill",
+  "browser_type",
+  "browser_press",
+  "browser_scroll",
+  "browser_select_option",
+  "browser_back",
+  "browser_forward",
+]);
 
 async function observed(request: HostRequest, operation: string, body?: object): Promise<ToolResult> {
   return textResult(formatObserved(pageSchema.parse(await request(operation, body))));
@@ -230,7 +302,39 @@ export async function callTool(name: string, args: unknown, request: HostRequest
     if (!parsed.success) return argumentError(name, parsed.error);
     return observed(request, "scroll", parsed.data);
   }
+  if (name === "browser_hover") {
+    const parsed = hoverArgs.safeParse(args);
+    if (!parsed.success) return argumentError(name, parsed.error);
+    return observed(request, "hover", { ref: parsed.data.ref });
+  }
+  if (name === "browser_drag") {
+    const parsed = dragArgs.safeParse(args);
+    if (!parsed.success) return argumentError(name, parsed.error);
+    return observed(request, "drag", { from: parsed.data.from, to: parsed.data.to });
+  }
+  if (name === "browser_select_option") {
+    const parsed = selectArgs.safeParse(args);
+    if (!parsed.success) return argumentError(name, parsed.error);
+    const values = Array.isArray(parsed.data.values) ? parsed.data.values : [parsed.data.values];
+    return observed(request, "select", { ref: parsed.data.ref, values });
+  }
+  if (name === "browser_wait_for") {
+    const parsed = waitArgs.safeParse(args ?? {});
+    if (!parsed.success) return argumentError(name, parsed.error);
+    const body: { text?: string; url?: string; timeoutMs?: number } = {};
+    if (parsed.data.text) body.text = parsed.data.text;
+    if (parsed.data.url) body.url = parsed.data.url;
+    if (parsed.data.timeout_ms) body.timeoutMs = parsed.data.timeout_ms;
+    return observed(request, "wait", body);
+  }
+  if (name === "browser_read") {
+    const page = readSchema.parse(await request("read"));
+    const url = safeBrowserUrl(page.url) ?? (page.url === "about:blank" ? "about:blank" : "URL unavailable");
+    if (!page.text.trim()) return textResult(`${page.title || "Untitled"}: ${url}\n(The page has no readable text.)`);
+    return textResult(`${page.title || "Untitled"}: ${url}\n\n${page.text}`);
+  }
   if (name === "browser_back") return observed(request, "back");
+  if (name === "browser_forward") return observed(request, "forward");
   if (name === "browser_state") {
     const state = stateSchema.parse(await request("state"));
     if (!state.url || state.url === "about:blank") return textResult("The browser tab is empty. Use browser_navigate to open a page.");

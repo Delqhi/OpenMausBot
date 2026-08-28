@@ -2,21 +2,24 @@ import { createRequire } from "node:module";
 import { describe, expect, it } from "vitest";
 
 const require = createRequire(import.meta.url);
-const { createBrowserSurfaceManager } = require("./browser-surface.cjs");
+const { GUEST_PROFILE, VIEWPORT, createBrowserSurfaceManager } = require("./browser-surface.cjs");
 
 const AX_NODES = [
   { role: { value: "link" }, name: { value: "Docs" }, backendDOMNodeId: 11 },
   { role: { value: "textbox" }, name: { value: "Search" }, backendDOMNodeId: 12 },
+  { role: { value: "combobox" }, name: { value: "Country" }, backendDOMNodeId: 13 },
 ];
 
 /** A WebContents + WebContentsView double that records what the manager
  * asked of it. CDP calls answer from a small table so the click/fill
- * sequences can be asserted verbatim. */
-function fakeView() {
+ * sequences can be asserted verbatim; protocol events can be injected. */
+function fakeView(partition) {
   const calls = [];
   const listeners = new Map();
+  const debuggerListeners = new Map();
   let url = "about:blank";
   let title = "";
+  let pageText = "Welcome. Docs Search";
   const webContents = {
     session: {
       getUserAgent: () => "Mozilla/5.0 Chrome/1 Electron/43 OpenMausBot/1",
@@ -38,12 +41,19 @@ function fakeView() {
     isLoading: () => false,
     getURL: () => url,
     getTitle: () => title,
-    navigationHistory: { canGoBack: () => url !== "about:blank", goBack: () => calls.push(["goBack"]) },
+    navigationHistory: {
+      canGoBack: () => url !== "about:blank",
+      canGoForward: () => false,
+      goBack: () => calls.push(["goBack"]),
+      goForward: () => calls.push(["goForward"]),
+    },
     loadURL: async (next) => {
       calls.push(["loadURL", next]);
       url = next;
       title = next === "about:blank" ? "" : "Loaded";
     },
+    enableDeviceEmulation: (options) => calls.push(["enableDeviceEmulation", options]),
+    disableDeviceEmulation: () => calls.push(["disableDeviceEmulation"]),
     close: () => calls.push(["close"]),
     capturePage: async () => ({
       getSize: () => ({ width: 2048, height: 1200 }),
@@ -57,19 +67,28 @@ function fakeView() {
         webContents.debugger.attached = true;
       },
       detach: () => calls.push(["detach"]),
-      on: () => {},
+      on: (name, handler) => debuggerListeners.set(name, handler),
       sendCommand: async (method, params) => {
         calls.push([method, params]);
         if (method === "Accessibility.getFullAXTree") return { nodes: AX_NODES };
         if (method === "DOM.getBoxModel") {
           if (params.backendNodeId === 99) throw new Error("No node with given id found");
-          return { model: { border: [10, 20, 110, 20, 110, 60, 10, 60] } };
+          const base = params.backendNodeId === 13 ? 200 : 10;
+          return { model: { border: [base, 20, base + 100, 20, base + 100, 60, base, 60] } };
         }
+        if (method === "DOM.resolveNode") return { object: { objectId: `obj-${params.backendNodeId}` } };
+        if (method === "Runtime.callFunctionOn") return { result: { value: { chosen: ["India"] } } };
+        if (method === "Runtime.evaluate") {
+          if (params.expression.includes("scrollingElement")) return { result: { value: { top: 0, height: 2400, view: 800 } } };
+          return { result: { value: pageText } };
+        }
+        if (method === "Page.captureScreenshot") return { data: Buffer.from("cdp-jpeg").toString("base64") };
         return {};
       },
     },
   };
   const view = {
+    partition,
     webContents,
     bounds: null,
     visible: null,
@@ -82,74 +101,154 @@ function fakeView() {
     getBounds: () => view.bounds ?? { x: 0, y: 0, width: 800, height: 600 },
     calls,
     listeners,
+    debuggerListeners,
+    setPageText: (text) => {
+      pageText = text;
+    },
   };
   return view;
 }
 
-function harness() {
+function harness(options = {}) {
   const views = [];
   const owner = {
     isDestroyed: () => false,
     getContentSize: () => [1200, 800],
     contentView: {
       children: [],
-      addChildView: (view) => owner.contentView.children.push(view),
+      addChildView: (view) => {
+        owner.contentView.children = owner.contentView.children.filter((candidate) => candidate !== view);
+        owner.contentView.children.push(view);
+      },
       removeChildView: (view) => {
         owner.contentView.children = owner.contentView.children.filter((candidate) => candidate !== view);
       },
     },
   };
   const states = [];
-  const partitions = [];
+  let clock = 0;
   const manager = createBrowserSurfaceManager({
     owner,
-    createView: (options) => {
-      partitions.push(options.webPreferences.partition);
-      const view = fakeView();
+    createView: (viewOptions) => {
+      const view = fakeView(viewOptions.webPreferences.partition);
       views.push(view);
       return view;
     },
     notify: (state) => states.push(state),
     platform: "darwin",
     settleMs: 0,
+    // real time (waits have real deadlines) but strictly monotonic (LRU order)
+    now: () => Date.now() + (clock += 1),
+    ...options,
   });
-  return { manager, owner, views, states, partitions };
+  return { manager, owner, views, states };
 }
 
 const cdpCalls = (view) => view.calls.filter(([name]) => /^[A-Z]/.test(name) && name.includes("."));
+const BOUNDS = { x: 20, y: 30, width: 400, height: 250 };
 
 describe("browser surface manager", () => {
   it("creates one sandboxed, partitioned view per bot only when something needs it", () => {
-    const { manager, owner, views, partitions } = harness();
+    const { manager, owner, views } = harness();
     expect(manager.layout("bot-a", null)).toMatchObject({ botId: "bot-a", open: false });
     expect(views).toHaveLength(0);
 
-    const state = manager.layout("bot-a", { x: 20.4, y: 30.6, width: 5000, height: 300 });
+    const state = manager.layout("bot-a", { x: 20.4, y: 30.6, width: 5000, height: 300 }, "", "compact");
     expect(views).toHaveLength(1);
-    expect(partitions).toEqual(["persist:openmausbot-browser-bot-a"]);
+    expect(views[0].partition).toBe("persist:openmausbot-browser-bot-a");
     expect(views[0].bounds).toEqual({ x: 20, y: 31, width: 1180, height: 300 });
     expect(views[0].visible).toBe(true);
     expect(owner.contentView.children).toEqual([views[0]]);
-    expect(state).toMatchObject({ botId: "bot-a", open: true, visible: true, url: "about:blank" });
+    expect(state).toMatchObject({ botId: "bot-a", open: true, visible: true, url: "about:blank", profile: "", mode: "compact" });
     expect(views[0].calls).toContainEqual(["setUserAgent", "Mozilla/5.0 Chrome/1"]);
 
     manager.layout("bot-a", null);
     expect(views[0].visible).toBe(false);
-    expect(() => manager.layout("../bad", { x: 0, y: 0, width: 10, height: 10 })).toThrow(/bot id/);
+    expect(() => manager.layout("../bad", BOUNDS)).toThrow(/bot id/);
   });
 
-  it("navigates only to web pages and answers with the page's elements", async () => {
+  it("scales the fixed desktop viewport into the compact box and shows it 1:1 when expanded", () => {
+    const { manager, views } = harness();
+    manager.layout("bot-a", BOUNDS, "", "compact");
+    const emulation = views[0].calls.find(([name]) => name === "enableDeviceEmulation")[1];
+    expect(emulation.viewSize).toEqual(VIEWPORT);
+    // 400/1280 = 0.3125 and 250/800 = 0.3125 — fit on both axes
+    expect(emulation.scale).toBeCloseTo(0.3125, 4);
+    manager.layout("bot-a", { x: 0, y: 0, width: 1100, height: 700 }, "", "expanded");
+    expect(views[0].calls.at(-1)).toEqual(["disableDeviceEmulation"]);
+    expect(manager.state("bot-a").mode).toBe("expanded");
+  });
+
+  it("navigates only to web pages and answers with the page's elements plus a scroll hint", async () => {
     const { manager, views } = harness();
     await expect(manager.navigate("bot-a", "file:///etc/passwd")).rejects.toThrow(/http and https/);
     const page = await manager.navigate("bot-a", "example.com");
     expect(views[0].calls).toContainEqual(["loadURL", "https://example.com/"]);
     expect(page.url).toBe("https://example.com/");
-    expect(page.elements).toEqual([
-      { ref: "b11", role: "link", name: "Docs" },
-      { ref: "b12", role: "textbox", name: "Search" },
-    ]);
+    expect(page.elements.map((element) => element.ref)).toEqual(["b11", "b12", "b13"]);
     expect(page.text).toContain('b11 link "Docs"');
+    expect(page.text).toContain("1600px below");
     expect(views[0].calls).toContainEqual(["attach", "1.3"]);
+    // attaching also enables Page events and intercepts native file pickers
+    expect(cdpCalls(views[0]).slice(0, 2).map(([name]) => name)).toEqual(["Page.enable", "Page.setInterceptFileChooserDialog"]);
+  });
+
+  it("keeps one live view per profile and switches by showing another, never rebuilding", async () => {
+    const { manager, owner, views, states } = harness();
+    manager.layout("bot-a", BOUNDS, "", "compact");
+    await manager.navigate("bot-a", "https://own.example");
+    // switch to a named profile: a second view in the shared partition takes the same rectangle
+    manager.layout("bot-a", BOUNDS, "work", "compact");
+    expect(views).toHaveLength(2);
+    expect(views[1].partition).toBe("persist:openmausbot-browser-profile-work");
+    expect(views[0].visible).toBe(false);
+    expect(views[1].visible).toBe(true);
+    expect(views[1].bounds).toEqual(BOUNDS);
+    expect(manager.state("bot-a")).toMatchObject({ profile: "work", url: "about:blank" });
+    await manager.navigate("bot-a", "https://work.example");
+    // back to the bot's own session: the first view is still there with its page
+    manager.layout("bot-a", BOUNDS, "", "compact");
+    expect(views).toHaveLength(2);
+    expect(manager.state("bot-a")).toMatchObject({ profile: "", url: "https://own.example/" });
+    expect(views[0].visible).toBe(true);
+    expect(views[1].visible).toBe(false);
+    expect(owner.contentView.children.at(-1)).toBe(views[0]);
+    // a caller that does not know the profile acts on whatever is active
+    const page = await manager.snapshot("bot-a");
+    expect(page.url).toBe("https://own.example/");
+    // another bot on the same named profile shares the session, not the view
+    manager.layout("bot-b", BOUNDS, "work", "compact");
+    expect(views[2].partition).toBe("persist:openmausbot-browser-profile-work");
+    expect(manager.list().filter((entry) => entry.active).map((entry) => entry.botId).sort()).toEqual(["bot-a", "bot-b"]);
+    expect(states.some((state) => state.botId === "bot-a" && state.profile === "work")).toBe(true);
+    expect(views[1].calls.some(([name]) => name === "close")).toBe(false);
+  });
+
+  it("forgets a Guest session the moment the bot switches off it", async () => {
+    const { manager, views } = harness();
+    manager.layout("bot-a", BOUNDS, GUEST_PROFILE, "compact");
+    expect(views[0].partition).toMatch(/^openmausbot-browser-guest-bot-a-\d+$/);
+    expect(views[0].partition.startsWith("persist:")).toBe(false);
+    await manager.navigate("bot-a", "https://secret.example");
+    manager.layout("bot-a", BOUNDS, "", "compact");
+    expect(views[0].calls.some(([name]) => name === "close")).toBe(true);
+    expect(manager.size()).toBe(1);
+    // a fresh Guest is a fresh partition
+    manager.layout("bot-a", BOUNDS, GUEST_PROFILE, "compact");
+    expect(views[2].partition).not.toBe(views[0].partition);
+  });
+
+  it("evicts the coldest view nobody is showing when the cap is reached", async () => {
+    const { manager, views } = harness({ maxViews: 3 });
+    manager.layout("bot-a", BOUNDS, "", "compact");
+    manager.layout("bot-a", BOUNDS, "p1", "compact");
+    manager.layout("bot-a", BOUNDS, "p2", "compact");
+    expect(manager.size()).toBe(3);
+    // the fourth view evicts the least recently used inactive one (own session)
+    manager.layout("bot-a", BOUNDS, "p3", "compact");
+    expect(manager.size()).toBe(3);
+    expect(views[0].calls.some(([name]) => name === "close")).toBe(true);
+    expect(manager.list().map((entry) => entry.profile).sort()).toEqual(["p1", "p2", "p3"]);
   });
 
   it("clicks at the centre of a known ref and refuses stale or unknown ones", async () => {
@@ -164,6 +263,25 @@ describe("browser surface manager", () => {
       { type: "mousePressed", x: 60, y: 40, button: "left", clickCount: 1 },
       { type: "mouseReleased", x: 60, y: 40, button: "left", clickCount: 1 },
     ]);
+    // a navigation invalidates every ref until the next snapshot
+    views[0].listeners.get("did-navigate")?.();
+    await expect(manager.click("bot-a", "b11")).rejects.toThrow(/changed since/);
+  });
+
+  it("hovers, drags, and chooses select options through the page", async () => {
+    const { manager, views } = harness();
+    await manager.navigate("bot-a", "https://example.com");
+    await manager.hover("bot-a", "b11");
+    expect(cdpCalls(views[0]).filter(([name, params]) => name === "Input.dispatchMouseEvent" && params.type === "mouseMoved")).toHaveLength(1);
+    await manager.drag("bot-a", "b11", "b13");
+    const dragMoves = cdpCalls(views[0]).filter(([name, params]) => name === "Input.dispatchMouseEvent" && params.type === "mouseMoved");
+    expect(dragMoves.at(-1)[1]).toMatchObject({ x: 250, y: 40 });
+    expect(cdpCalls(views[0]).filter(([name, params]) => name === "Input.dispatchMouseEvent" && params.type === "mouseReleased").at(-1)[1]).toMatchObject({ x: 250, y: 40 });
+    await manager.select("bot-a", "b13", "India");
+    const call = cdpCalls(views[0]).find(([name]) => name === "Runtime.callFunctionOn")[1];
+    expect(call.objectId).toBe("obj-13");
+    expect(call.arguments).toEqual([{ value: ["India"] }]);
+    await expect(manager.select("bot-a", "b13", [])).rejects.toThrow(/option value or label/);
   });
 
   it("fills a field by focusing it, selecting everything, and inserting text", async () => {
@@ -185,7 +303,7 @@ describe("browser surface manager", () => {
     expect(cdpCalls(views[0]).find(([name, params]) => name === "Input.dispatchKeyEvent" && params.key === "a")[1].modifiers).toBe(4);
   });
 
-  it("presses named keys, scrolls, and screenshots at a bounded width", async () => {
+  it("presses named keys, scrolls the fixed viewport, and screenshots through the protocol", async () => {
     const { manager, views } = harness();
     await manager.navigate("bot-a", "https://example.com");
     await expect(manager.press("bot-a", "F13")).rejects.toThrow(/unsupported key/);
@@ -193,39 +311,38 @@ describe("browser surface manager", () => {
     const enter = cdpCalls(views[0]).find(([name, params]) => name === "Input.dispatchKeyEvent" && params.key === "Enter" && params.type === "keyDown");
     expect(enter?.[1]).toMatchObject({ type: "keyDown", key: "Enter", code: "Enter", windowsVirtualKeyCode: 13, text: "\r" });
     await manager.scroll("bot-a", "down");
-    expect(cdpCalls(views[0]).find(([name, params]) => name === "Input.dispatchMouseEvent" && params.type === "mouseWheel")[1]).toMatchObject({ deltaX: 0, deltaY: 600 });
+    expect(cdpCalls(views[0]).find(([name, params]) => name === "Input.dispatchMouseEvent" && params.type === "mouseWheel")[1]).toMatchObject({ x: 640, y: 400, deltaX: 0, deltaY: 600 });
     await expect(manager.scroll("bot-a", "sideways")).rejects.toThrow(/direction/);
     const shot = await manager.screenshot("bot-a");
-    expect(shot).toMatchObject({ format: "jpeg", width: 1024, png: Buffer.from("jpeg").toString("base64") });
+    expect(shot).toMatchObject({ format: "jpeg", width: 1024, height: 640, png: Buffer.from("cdp-jpeg").toString("base64") });
   });
 
-  it("points a bot at a shared named profile, and switching profiles replaces its tab", async () => {
-    const { manager, owner, views, partitions, states } = harness();
-    manager.layout("bot-a", { x: 0, y: 0, width: 100, height: 100 }, "work");
-    manager.layout("bot-b", { x: 0, y: 0, width: 100, height: 100 }, "work");
-    // one session for both bots — a sign-in in one is a sign-in in the other
-    expect(partitions).toEqual(["persist:openmausbot-browser-profile-work", "persist:openmausbot-browser-profile-work"]);
-    expect(manager.state("bot-a").partition).toBe("persist:openmausbot-browser-profile-work");
-    // a caller that does not know the profile never evicts the tab
+  it("waits for text or an address, reads the page, and reports dialogs it answered", async () => {
+    const { manager, views } = harness();
     await manager.navigate("bot-a", "https://example.com");
-    expect(views).toHaveLength(2);
-    // back to the bot's own session: the old tab is torn down and replaced
-    manager.layout("bot-a", { x: 0, y: 0, width: 100, height: 100 }, "");
-    expect(views).toHaveLength(3);
-    expect(partitions.at(-1)).toBe("persist:openmausbot-browser-bot-a");
-    expect(owner.contentView.children).toHaveLength(2);
-    expect(states.some((state) => state.botId === "bot-a" && state.open === false && state.code === "profile-changed")).toBe(true);
-    expect(() => manager.layout("bot-a", { x: 0, y: 0, width: 100, height: 100 }, "../evil")).not.toThrow();
-    expect(partitions.at(-1)).toBe("persist:openmausbot-browser-profile-evil");
+    const read = await manager.read("bot-a");
+    expect(read).toMatchObject({ url: "https://example.com/", text: "Welcome. Docs Search", truncated: false });
+    await expect(manager.waitFor("bot-a", { text: "Docs" })).resolves.toMatchObject({ url: "https://example.com/" });
+    await expect(manager.waitFor("bot-a", { text: "never there", timeoutMs: 300 })).rejects.toThrow(/timed out waiting for text "never there"/);
+    await expect(manager.waitFor("bot-a", { url: "example.com" })).resolves.toBeTruthy();
+    // a JS dialog is answered by the surface and surfaces in the next result
+    views[0].debuggerListeners.get("message")?.({}, "Page.javascriptDialogOpening", { type: "confirm", message: "Leave page?" });
+    expect(cdpCalls(views[0]).at(-1)).toEqual(["Page.handleJavaScriptDialog", { accept: true }]);
+    const page = await manager.snapshot("bot-a");
+    expect(page.dialogs).toEqual([{ type: "confirm", message: "Leave page?" }]);
+    expect(page.text).toContain('Dialog (confirm) was answered automatically: "Leave page?"');
+    expect((await manager.snapshot("bot-a")).dialogs).toEqual([]);
   });
 
   it("tears every view down on closeAll and hides them all on hideAll", async () => {
     const { manager, owner, views, states } = harness();
-    manager.layout("bot-a", { x: 0, y: 0, width: 100, height: 100 });
-    manager.layout("bot-b", { x: 0, y: 0, width: 100, height: 100 });
+    manager.layout("bot-a", BOUNDS, "", "compact");
+    manager.layout("bot-b", BOUNDS, "", "compact");
     expect(manager.size()).toBe(2);
     manager.hideAll();
     expect(views.map((view) => view.visible)).toEqual([false, false]);
+    manager.close("bot-a");
+    expect(manager.size()).toBe(1);
     manager.closeAll();
     expect(manager.size()).toBe(0);
     expect(owner.contentView.children).toEqual([]);

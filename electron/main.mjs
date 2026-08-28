@@ -1004,9 +1004,12 @@ function desktopWorkspaceForEvent(event, create = false) {
   return create ? ensureDesktopWorkspace(owner) : desktopWorkspaceManager;
 }
 
-/** The built-in browser: one WebContentsView per bot inside the app window,
- * plus the loopback host the bot's tools call. Never blocks the window —
- * without it the Browser tab simply reports itself unavailable. */
+/** The built-in browser: WebContentsViews per bot inside the app window,
+ * plus the loopback host the bot's tools call. The host (and the token in
+ * the descriptor) lives for the whole process; the surface belongs to a
+ * window and is rebuilt for every window created — macOS keeps the app
+ * alive with none open, and `activate` makes a new one. Never blocks the
+ * window: without it the Browser tab simply reports itself unavailable. */
 async function startBrowserSurface(owner) {
   try {
     browserSurface = createBrowserSurfaceManager({
@@ -1016,9 +1019,11 @@ async function startBrowserSurface(owner) {
         if (!owner.isDestroyed() && !owner.webContents.isDestroyed()) owner.webContents.send("browser:state", state);
       },
     });
-    browserHost = createBrowserHost({ manager: browserSurface });
-    await browserHost.start();
-    browserConnectionStore.persist(browserHost.descriptor());
+    if (!browserHost) {
+      browserHost = createBrowserHost({ manager: () => browserSurface });
+      await browserHost.start();
+      browserConnectionStore.persist(browserHost.descriptor());
+    }
     // A renderer reload or crash loses the panel that positioned the views;
     // hide them until a mounted Browser tab lays them out again. The pages
     // themselves stay alive — a bot mid-task must not lose its tab.
@@ -1026,15 +1031,15 @@ async function startBrowserSurface(owner) {
       if (isMainFrame && !isInPlace) browserSurface?.hideAll();
     });
     owner.webContents.on("render-process-gone", () => browserSurface?.hideAll());
+    const surface = browserSurface;
     owner.once("closed", () => {
-      browserSurface?.closeAll();
-      browserSurface = null;
+      surface.closeAll();
+      if (browserSurface === surface) browserSurface = null;
     });
-    slog(`browser surface listening at ${browserHost.url}`);
+    slog(`browser surface ready for window ${owner.id} (host ${browserHost.url})`);
   } catch (error) {
     slog(`browser surface unavailable: ${error?.message ?? error}`);
     browserSurface = null;
-    browserHost = null;
   }
 }
 
@@ -1049,9 +1054,18 @@ function browserSurfaceForEvent(event) {
 
 ipcMain.handle("browser:available", () => Boolean(browserSurface && browserHost?.url));
 ipcMain.handle("browser:state", (event, botId) => browserSurfaceForEvent(event).state(botId));
-ipcMain.handle("browser:layout", (event, botId, bounds, profile) =>
-  browserSurfaceForEvent(event).layout(botId, bounds ?? null, Object.prototype.toString.call(profile) === "[object String]" ? profile : undefined),
+ipcMain.handle("browser:layout", (event, botId, bounds, profile, mode) =>
+  browserSurfaceForEvent(event).layout(
+    botId,
+    bounds ?? null,
+    Object.prototype.toString.call(profile) === "[object String]" ? profile : undefined,
+    mode === "expanded" ? "expanded" : "compact",
+  ),
 );
+ipcMain.handle("browser:forward", async (event, botId) => {
+  const result = await browserSurfaceForEvent(event).forward(botId);
+  return { url: result.url, title: result.title };
+});
 ipcMain.handle("browser:navigate", async (event, botId, url) => {
   const result = await browserSurfaceForEvent(event).navigate(botId, url);
   return { url: result.url, title: result.title };
@@ -1115,6 +1129,7 @@ function createWindow() {
     },
   });
   mainWindow = win;
+  void startBrowserSurface(win);
   if (waitsForSkinSync) {
     // A broken renderer or preload must not strand the app as an invisible
     // process. Normal startup shows from desktop:skin almost immediately;
@@ -1752,7 +1767,6 @@ app.whenReady().then(async () => {
     void startDesktopCompanion({ waitForHosted: false, remember: false });
   }
   const win = createWindow();
-  await startBrowserSurface(win);
   // Reconcile incomplete setup and resume interrupted sign-out only after the
   // local app is usable. This background network work never gates LAN pairing
   // or the first window.

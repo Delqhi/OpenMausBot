@@ -63,7 +63,8 @@ const localVmConfigSchema = z.object({
 /** A named, shareable browser session ("Work", "Client A"). The id names a
  * durable Electron partition; user-controlled characters never reach it. */
 const browserProfileSchema = z.object({
-  id: z.string().regex(/^[A-Za-z0-9_-]{1,40}$/),
+  // "guest" is the throwaway session's reserved id, never a saved profile
+  id: z.string().regex(/^[A-Za-z0-9_-]{1,40}$/).refine((id) => id !== "guest", "guest is reserved"),
   name: z.string().trim().min(1).max(40),
 }).strict();
 const browserProfilesSchema = z.array(browserProfileSchema).max(20);

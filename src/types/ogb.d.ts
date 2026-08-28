@@ -108,9 +108,12 @@ type SkillRecordingPayload = {
     title: string;
     loading: boolean;
     canGoBack: boolean;
+    canGoForward?: boolean;
     visible: boolean;
-    partition?: string;
-    code?: "renderer-gone" | "profile-changed";
+    partition?: string | null;
+    profile?: string | null;
+    mode?: "compact" | "expanded" | null;
+    code?: "renderer-gone" | "profile-changed" | "evicted";
   }
 
   interface DesktopWorkspaceState {
@@ -207,9 +210,15 @@ type SkillRecordingPayload = {
       browser?: {
         available(): Promise<boolean>;
         state(botId: string): Promise<BrowserSurfaceState>;
-        layout(botId: string, bounds: DesktopWorkspaceBounds | null, profile?: string): Promise<BrowserSurfaceState>;
+        layout(
+          botId: string,
+          bounds: DesktopWorkspaceBounds | null,
+          profile?: string,
+          mode?: "compact" | "expanded",
+        ): Promise<BrowserSurfaceState>;
         navigate(botId: string, url: string): Promise<{ url: string; title: string }>;
         back(botId: string): Promise<{ url: string; title: string }>;
+        forward?(botId: string): Promise<{ url: string; title: string }>;
         close(botId: string): Promise<boolean>;
         onState(cb: (state: BrowserSurfaceState) => void): () => void;
       };

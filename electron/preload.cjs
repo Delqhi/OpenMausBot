@@ -158,9 +158,10 @@ contextBridge.exposeInMainWorld("ogb", {
   browser: {
     available: () => ipcRenderer.invoke("browser:available"),
     state: (botId) => ipcRenderer.invoke("browser:state", botId),
-    layout: (botId, bounds) => ipcRenderer.invoke("browser:layout", botId, bounds),
+    layout: (botId, bounds, profile, mode) => ipcRenderer.invoke("browser:layout", botId, bounds, profile, mode),
     navigate: (botId, url) => ipcRenderer.invoke("browser:navigate", botId, url),
     back: (botId) => ipcRenderer.invoke("browser:back", botId),
+    forward: (botId) => ipcRenderer.invoke("browser:forward", botId),
     close: (botId) => ipcRenderer.invoke("browser:close", botId),
     onState: (cb) => {
       const handler = (_event, state) => cb(state);

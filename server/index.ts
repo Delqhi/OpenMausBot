@@ -250,8 +250,9 @@ function browserIntegration(botId: string, profile: string | undefined) {
   const connection = readBrowserConnection();
   if (!connection) return null;
   const control = controlIntegration(botId);
-  // a profile that no longer exists falls back to the bot's own session
-  const profileId = profile && (cfg.browserProfiles ?? []).some((candidate) => candidate.id === profile) ? profile : "";
+  // a profile that no longer exists falls back to the bot's own session;
+  // "guest" is a throwaway session the surface forgets on switch-away
+  const profileId = profile === "guest" || (profile && (cfg.browserProfiles ?? []).some((candidate) => candidate.id === profile)) ? profile : "";
   return {
     connection,
     profile: profileId,
@@ -4886,7 +4887,7 @@ const server = createServer(async (req, res) => {
         if (body.browserProfile === null || body.browserProfile === "") patch.browserProfile = undefined;
         else if (
           typeof body.browserProfile === "string" &&
-          (cfg.browserProfiles ?? []).some((profile) => profile.id === body.browserProfile)
+          (body.browserProfile === "guest" || (cfg.browserProfiles ?? []).some((profile) => profile.id === body.browserProfile))
         ) {
           patch.browserProfile = body.browserProfile;
         } else return json(res, 400, { error: "browserProfile must name an existing browser profile" });

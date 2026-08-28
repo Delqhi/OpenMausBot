@@ -65,6 +65,8 @@ beforeAll(async () => {
         return res.end(JSON.stringify({ error: "that browser ref is stale or unknown — take a new browser_snapshot" }));
       }
       if (path.endsWith("/state")) return res.end(JSON.stringify({ url: PAGE.url, title: PAGE.title, loading: true }));
+      if (path.endsWith("/read")) return res.end(JSON.stringify({ url: PAGE.url, title: PAGE.title, text: "Cart\n\n2 items · $80", truncated: false }));
+      if (path.endsWith("/wait")) return res.end(JSON.stringify({ ...PAGE, notes: ["More of the page is off-screen: 900px below (browser_scroll to see it)."] }));
       if (path.endsWith("/screenshot")) return res.end(JSON.stringify({ png: "ZmFrZQ==", format: "jpeg" }));
       res.end(JSON.stringify(PAGE));
     });
@@ -115,7 +117,13 @@ describe("browser MCP proxy", () => {
       "browser_type",
       "browser_press",
       "browser_scroll",
+      "browser_hover",
+      "browser_drag",
+      "browser_select_option",
+      "browser_wait_for",
+      "browser_read",
       "browser_back",
+      "browser_forward",
       "browser_state",
       "browser_screenshot",
     ]);
@@ -147,6 +155,29 @@ describe("browser MCP proxy", () => {
     expect(text(stale)).toMatch(/stale or unknown/);
     const missing = await callTool("browser_click", {});
     expect(missing.result.isError).toBe(true);
+  });
+
+  it("forwards the parity actions and relays the surface's notes", async () => {
+    hits.length = 0;
+    await callTool("browser_hover", { ref: "b1" });
+    await callTool("browser_drag", { from: "b1", to: "b2" });
+    await callTool("browser_select_option", { ref: "b2", values: "India" });
+    await callTool("browser_select_option", { ref: "b2", values: ["a", "b"] });
+    await callTool("browser_forward", {});
+    const waited = await callTool("browser_wait_for", { text: "Cart", timeout_ms: 2000 });
+    expect(hits.map((hit) => [hit.path.replace("/v1/bots/bot-1/", ""), hit.body])).toEqual([
+      ["hover", { ref: "b1", profile: "work" }],
+      ["drag", { from: "b1", to: "b2", profile: "work" }],
+      ["select", { ref: "b2", values: ["India"], profile: "work" }],
+      ["select", { ref: "b2", values: ["a", "b"], profile: "work" }],
+      ["forward", { profile: "work" }],
+      ["wait", { text: "Cart", timeoutMs: 2000, profile: "work" }],
+    ]);
+    expect(text(waited)).toContain("More of the page is off-screen: 900px below");
+    const read = await callTool("browser_read", {});
+    expect(text(read)).toBe("Cart: https://shop.example/cart\n\nCart\n\n2 items · $80");
+    const bad = await callTool("browser_select_option", { ref: "b2" });
+    expect(bad.result.isError).toBe(true);
   });
 
   it("reads state and screenshots without touching the page", async () => {
