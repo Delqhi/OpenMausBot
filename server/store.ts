@@ -15,6 +15,7 @@ import { pickBotName } from "./names.ts";
 import { redactSecretsInText } from "./redact.ts";
 import { botAvatarProfile, type BotAvatarCrop } from "../shared/bot-avatar.ts";
 import type { RoutineRequestCardData } from "../shared/routine-request.ts";
+import type { RoutineRunCardData } from "../shared/routine-run.ts";
 
 export type MausColor =
   | "green"
@@ -87,11 +88,14 @@ export interface SecretRequestCardData {
 export interface Message {
   id: string;
   role: "bot" | "user";
-  kind: "text" | "options" | "activity" | "screen" | "connector" | "secret";
+  kind: "text" | "options" | "activity" | "screen" | "connector" | "secret" | "routine.run";
   text?: string;
   card?: OptionCardData;
   connector?: ConnectorCardData;
   secret?: SecretRequestCardData;
+  /** One idempotently updated status card in the conversation that created a
+   * routine. The actual provider turn remains in its isolated task. */
+  routineRun?: RoutineRunCardData;
   /** activity messages: tool name + outcome. `spoken` is the same chip as
    * a phrase a voice can read ("reading a file") — computed once here so
    * call mode never has to re-derive it from the raw tool name, and absent
@@ -113,6 +117,8 @@ export interface Message {
   /** Optional flat reply reference. Unlike parentId this never changes the
    * conversation branch; it only quotes one earlier text message inline. */
   replyToId?: string;
+  /** Stable client identity for at-most-once chat POST retries. */
+  sendId?: string;
   /** group threads: which member said this (sender attribution). */
   from?: { botId: string; name: string; color: string };
   /** emoji reactions; by = "user" or a member botId. */
@@ -240,6 +246,13 @@ function redactBotAuthored<T extends Omit<Message, "id" | "at"> & { at?: number 
   const out = { ...message };
   if (typeof out.text === "string") out.text = redactSecretsInText(out.text);
   if (out.tool?.name) out.tool = { ...out.tool, name: redactSecretsInText(out.tool.name) };
+  if (out.routineRun) {
+    const routineRun = { ...out.routineRun };
+    routineRun.routineName = redactSecretsInText(routineRun.routineName);
+    if (routineRun.summary) routineRun.summary = redactSecretsInText(routineRun.summary);
+    if (routineRun.error) routineRun.error = redactSecretsInText(routineRun.error);
+    out.routineRun = routineRun;
+  }
   if (out.card) {
     const card = { ...out.card } as OptionCardData & { summary?: string };
     card.title = redactSecretsInText(card.title);
@@ -639,15 +652,14 @@ export class Store {
         continue;
       }
       if (!g.tasks?.length) {
-        g.tasks = [
-          {
-            threadId: g.threadId,
-            title: this.firstUserLine(g.threadId) ?? UNTITLED_TASK,
-            createdAt: g.createdAt,
-            ...(g.pinnedCwd !== undefined ? { pinnedCwd: g.pinnedCwd } : {}),
-            ...(g.pinnedMessageId ? { pinnedMessageId: g.pinnedMessageId } : {}),
-          },
-        ];
+        const initialTask: GroupTaskRecord = {
+          threadId: g.threadId,
+          title: this.firstUserLine(g.threadId) ?? UNTITLED_TASK,
+          createdAt: g.createdAt,
+        };
+        if (g.pinnedCwd !== undefined) initialTask.pinnedCwd = g.pinnedCwd;
+        if (g.pinnedMessageId) initialTask.pinnedMessageId = g.pinnedMessageId;
+        g.tasks = [initialTask];
         groupsMigrated = true;
       }
       // Repair a malformed/stale active pointer conservatively. Every task
@@ -694,7 +706,7 @@ export class Store {
   }
 
   private saveGroups() {
-    writeFileAtomic(GROUPS_FILE, JSON.stringify(this.groups.map(({ busyBotId, ...g }) => g), null, 2));
+    writeFileAtomic(GROUPS_FILE, JSON.stringify(this.groups.map(({ busyBotId: _busyBotId, ...g }) => g), null, 2));
   }
 
   // ── groups ────────────────────────────────────────────────────────────
@@ -741,9 +753,6 @@ export class Store {
     const group: GroupRecord = {
       id: newId(),
       threadId,
-      ...(dm
-        ? {}
-        : { tasks: [{ threadId, title: UNTITLED_TASK, createdAt }] }),
       name,
       memberIds,
       defaultResponder: dm
@@ -755,13 +764,12 @@ export class Store {
       dm: dm || undefined,
       busyBotId: null,
       section,
-      ...(dm
-        ? {}
-        : {
-            setupCompletedAt: setup?.completed ? createdAt : null,
-            setupSkippedAt: null,
-          }),
     };
+    if (!dm) {
+      group.tasks = [{ threadId, title: UNTITLED_TASK, createdAt }];
+      group.setupCompletedAt = setup?.completed ? createdAt : null;
+      group.setupSkippedAt = null;
+    }
     this.groups.unshift(group);
     this.saveGroups();
     this.emit({ type: "group", groupId: group.id });
@@ -839,7 +847,7 @@ export class Store {
     if (!group || group.dm) return null;
     const task: GroupTaskRecord = {
       threadId: newId(),
-      title: title?.trim() || UNTITLED_TASK,
+      title: title?.trim().slice(0, 80) || UNTITLED_TASK,
       createdAt: Date.now(),
     };
     group.tasks = [task, ...(group.tasks ?? [])];

@@ -539,6 +539,23 @@ describe("Store change stream", () => {
     expect(events.at(-1)).toEqual({ type: "group.deleted", groupId: g.id });
   });
 
+  it("delivers each change to the listener snapshot captured before emission", () => {
+    const store = new Store(selection);
+    const bot = store.createBot();
+    const seen: string[] = [];
+    let removeSecond = () => {};
+    store.onChange(() => {
+      seen.push("first");
+      removeSecond();
+      store.onChange(() => seen.push("late"));
+    });
+    removeSecond = store.onChange(() => seen.push("second"));
+
+    store.patchBot(bot.id, { name: "Snapshot" });
+
+    expect(seen).toEqual(["first", "second"]);
+  });
+
   it("unsubscribe stops delivery", () => {
     const store = new Store(selection);
     const bot = store.createBot();
@@ -647,6 +664,23 @@ describe("Store redacts bot-authored secrets on write", () => {
     if (routineCard.card?.routineRequest?.operation.action !== "create") throw new Error("missing routine payload");
     expect(routineCard.card.routineRequest.operation.routine.name).not.toContain(key);
     expect(routineCard.card.routineRequest.operation.routine.instructions).not.toContain(key);
+    const runCard = store.appendMessage(bot.threadId, {
+      role: "bot",
+      kind: "routine.run",
+      text: `Routine ${key} completed`,
+      routineRun: {
+        runId: "run-1",
+        routineId: "routine-1",
+        routineName: `Report ${key}`,
+        status: "completed",
+        executionThreadId: "execution-1",
+        summary: `Finished with ${key}`,
+        error: `Ignored ${key}`,
+      },
+    });
+    expect(runCard.routineRun?.routineName).not.toContain(key);
+    expect(runCard.routineRun?.summary).not.toContain(key);
+    expect(runCard.routineRun?.error).not.toContain(key);
     const secretCard = store.appendMessage(bot.threadId, {
       role: "bot",
       kind: "secret",

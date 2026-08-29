@@ -9,6 +9,7 @@ import {
   useStore,
   useStreaming,
   formatTime,
+  openNotificationTarget,
   type Bot,
   type Group,
   type GroupDefaultResponder,
@@ -26,6 +27,7 @@ import { GroupTaskPicker } from "./TaskPicker";
 import { ReplyQuote } from "./ReplyQuote";
 import { ConnectorCard } from "./ConnectorCard";
 import { SecretRequestCard } from "./SecretRequestCard";
+import { hasRoutineExecutionTask, RoutineRunCard } from "./RoutineRunCard";
 import { AttachedImageGallery } from "./AttachmentPreview";
 import { GroupCallButton, GroupCallOverlay } from "./GroupCallView";
 import { ReactionBar, ReactionChips } from "./Reactions";
@@ -38,6 +40,7 @@ import { cn } from "@/lib/cn";
 import { useFocusMessage } from "@/lib/focus-message";
 import { shortPath } from "@/lib/short-path";
 import { BOTTOM_FOLLOW_THRESHOLD, shouldResumeBottomFollow } from "@/lib/bottom-follow";
+import { useComposerDockPad } from "@/lib/composer-dock";
 import { showWorkingDots } from "@/lib/turn-tail";
 import { liveActivityLabel } from "@/lib/live-activity";
 import { splitAttachedImages } from "@/lib/composer-attachments";
@@ -48,6 +51,7 @@ import {
   resolveTranscriptWindow,
   tailWindowStart,
 } from "@/lib/transcript-window";
+import { useReplyDraft } from "@/lib/drafts";
 
 function dayLabel(at: number): string {
   const d = new Date(at);
@@ -177,6 +181,11 @@ const Transcript = memo(function Transcript({
         const user = m.role === "user";
         const attachedImages = user && m.text ? splitAttachedImages(m.text) : null;
         const newCluster = !prev || prev.role !== m.role || prev.from?.botId !== m.from?.botId || newDay;
+        const routineOwner = m.kind === "routine.run" ? memberOf(m.from?.botId) : undefined;
+        const routineExecutionThreadId = m.routineRun?.executionThreadId;
+        const routineTarget = routineOwner && hasRoutineExecutionTask(routineOwner.tasks, routineExecutionThreadId)
+          ? { botId: routineOwner.id, threadId: routineExecutionThreadId }
+          : undefined;
         const row =
           // a member can hit a permission ask mid-turn; without this the
           // card never rendered here and the bot waited out its timeout.
@@ -190,6 +199,15 @@ const Transcript = memo(function Transcript({
           ) : m.kind === "options" && m.card?.requestId && m.card.tool ? (
             <div className="flex justify-start">
               <ApprovalCard bot={memberOf(m.from?.botId)} message={m} />
+            </div>
+          ) : m.kind === "routine.run" ? (
+            <div className="flex justify-start">
+              <RoutineRunCard
+                message={m}
+                onOpen={routineTarget
+                  ? () => openNotificationTarget(dispatch, routineTarget, state)
+                  : undefined}
+              />
             </div>
           ) : m.kind === "activity" && m.tool ? (
             m.tool.ok === false || m.tool.name.startsWith("error:") || showToolCalls ? (
@@ -804,6 +822,8 @@ export function GroupView({ group }: { group: Group }) {
   const stream = useStreaming();
   const streaming = stream.streaming[group.threadId];
   const scrollRef = useRef<HTMLDivElement>(null);
+  const composerDockRef = useRef<HTMLDivElement>(null);
+  const composerDock = useComposerDockPad(composerDockRef);
   const [follow, setFollow] = useState(true);
   const followRef = useRef(true);
   const previousScrollTop = useRef(0);
@@ -813,11 +833,14 @@ export function GroupView({ group }: { group: Group }) {
   const [folderOpen, setFolderOpen] = useState(false);
   const [membersOpen, setMembersOpen] = useState(false);
   const [findOpen, setFindOpen] = useState(false);
-  const [replyTo, setReplyTo] = useState<Message | null>(null);
+  const { replyTo, selectReply, clearReply, consumeReply, restoreReply } = useReplyDraft(
+    group.threadId,
+    `group:${group.id}:${group.threadId}`,
+    group.messages,
+  );
   const membersTriggerRef = useRef<HTMLButtonElement>(null);
   const closeMembers = useCallback(() => setMembersOpen(false), []);
   useEffect(() => setFindOpen(false), [group.threadId]);
-  useEffect(() => setReplyTo(null), [group.threadId]);
   useEffect(() => {
     const onFind = (event: KeyboardEvent) => {
       if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "f") {
@@ -924,13 +947,14 @@ export function GroupView({ group }: { group: Group }) {
   useEffect(() => setFolderOpen(false), [group.id]);
   useEffect(() => setMembersOpen(false), [group.id]);
   // deps track the FULL messages.length, so expanding the window (which only
-  // changes windowedMessages) can never re-trigger this bottom scrollTo
+  // changes windowedMessages) can never re-trigger this bottom scrollTo.
+  // `follow` is intentionally omitted — see ChatView.
   useEffect(() => {
     const el = scrollRef.current;
     if (!el || !followRef.current) return;
     el.scrollTo({ top: el.scrollHeight });
     previousScrollTop.current = el.scrollTop;
-  }, [group.id, group.messages.length, streaming, group.busyBotId, follow]);
+  }, [group.id, group.messages.length, streaming, group.busyBotId, composerDock.pad]);
 
   // Expanding prepends rows: capture the height first, then after the commit
   // shift scrollTop by the growth so the message under the cursor stays put
@@ -989,10 +1013,6 @@ export function GroupView({ group }: { group: Group }) {
     </span>
   ));
 
-  const isWin = window.ogb?.platform === "win32";
-  const drag = isWin ? ({ WebkitAppRegion: "drag" } as React.CSSProperties) : undefined;
-  const noDrag = isWin ? ({ WebkitAppRegion: "no-drag" } as React.CSSProperties) : undefined;
-
   return (
     <main className="relative flex h-full min-w-0 flex-1 flex-col bg-app">
       <GroupCallOverlay group={group} members={members} />
@@ -1005,15 +1025,13 @@ export function GroupView({ group }: { group: Group }) {
           "flex items-center justify-between px-5 py-3",
           // Room for the drawer button, which overlays this corner below md.
           "pl-11 md:pl-5",
-          isWin && "pr-[148px]",
         )}
-        style={drag}
       >
-        <div className="flex min-w-0 items-center gap-2" style={noDrag}>
+        <div className="flex min-w-0 items-center gap-2">
           <span className="truncate text-[15px] font-semibold text-ink">{group.name}</span>
           {!setupPending && !group.dm && <GroupTaskPicker group={group} />}
         </div>
-        <div className="flex items-center gap-1.5" style={noDrag}>
+        <div className="flex items-center gap-1.5">
           <button
             type="button"
             onClick={() => setFindOpen((open) => !open)}
@@ -1129,10 +1147,10 @@ export function GroupView({ group }: { group: Group }) {
         );
       })()}
 
-      {/* Transcript */}
+      <div className="relative min-h-0 flex-1">
       <div
         ref={scrollRef}
-        className="flex-1 overflow-x-hidden overflow-y-auto px-5 [overflow-anchor:none]"
+        className="h-full overflow-x-hidden overflow-y-auto px-5 [overflow-anchor:none]"
         onWheel={(e) => {
           if (e.deltaY < 0) setBottomFollow(false);
           else if (atEnd()) setBottomFollow(true);
@@ -1163,7 +1181,8 @@ export function GroupView({ group }: { group: Group }) {
           </div>
         ) : (
         <div
-          className="flex w-full flex-col gap-3 pb-4"
+          className="flex w-full flex-col gap-3"
+          style={{ paddingBottom: composerDock.pad }}
           role="log"
           aria-live="polite"
           aria-label={`Room ${group.name}`}
@@ -1205,7 +1224,7 @@ export function GroupView({ group }: { group: Group }) {
             messages={windowedMessages}
             transcript={group.messages}
             emergingId={popping?.id}
-            onReply={setReplyTo}
+            onReply={selectReply}
           />
           {laterCount > 0 && (
             <div className="flex justify-center">
@@ -1254,20 +1273,26 @@ export function GroupView({ group }: { group: Group }) {
             });
           }}
           aria-label="Jump to latest messages"
-          className="animate-pop-in absolute bottom-24 left-1/2 z-10 flex -translate-x-1/2 items-center gap-1.5 rounded-full border border-hairline/40 bg-raised px-3 py-1.5 text-[12.5px] text-ink shadow-lg hover:bg-raised-hover"
+          className="animate-pop-in absolute left-1/2 z-10 flex -translate-x-1/2 items-center gap-1.5 rounded-full border border-hairline/40 bg-raised px-3 py-1.5 text-[12.5px] text-ink shadow-lg hover:bg-raised-hover"
+          style={{ bottom: composerDock.height }}
         >
           <ArrowDown size={13} /> Jump to latest
         </button>
       )}
 
+      <div ref={composerDockRef} className="absolute inset-x-0 bottom-0 z-[2]">
       <Composer
         key={group.threadId}
         group={group}
         members={members}
         locked={setupPending}
         replyTo={replyTo}
-        onClearReply={() => setReplyTo(null)}
+        onClearReply={clearReply}
+        onConsumeReply={consumeReply}
+        onRestoreReply={restoreReply}
       />
+      </div>
+      </div>
     </main>
   );
 }

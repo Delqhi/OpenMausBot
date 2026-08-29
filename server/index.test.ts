@@ -9,6 +9,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, wri
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { DatabaseSync } from "node:sqlite";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { z } from "zod";
 
@@ -40,6 +41,18 @@ const api = async (method: string, path: string, body?: unknown): Promise<{ stat
     body: body ? JSON.stringify(body) : undefined,
   });
   return { status: res.status, body: await res.json() };
+};
+
+const storedMessageCount = (threadId: string): number => {
+  const db = new DatabaseSync(join(home, ".openmausbot", "messages.db"), { readOnly: true });
+  try {
+    const row = z.object({ count: z.number() }).parse(
+      db.prepare("SELECT COUNT(*) AS count FROM messages WHERE thread_id = ?").get(threadId),
+    );
+    return row.count;
+  } finally {
+    db.close();
+  }
 };
 
 const uploadAvatar = async (mime = "image/png"): Promise<string> => {
@@ -223,6 +236,9 @@ beforeAll(async () => {
       OMB_BOX_API: `http://127.0.0.1:${boxStubPort}`,
       OMB_COMPOSIO_API: `http://127.0.0.1:${boxStubPort}/api/v3.1`,
       OMB_STATIC_DIR: staticDir,
+      // Production uses 15s. Keep the real timer path while making the
+      // browser-visible heartbeat assertion fast and deterministic.
+      OMB_SSE_HEARTBEAT_MS: "50",
       FAKE_CLAUDE_MODE: "hang",
       FAKE_CLAUDE_DUMP: fakeClaudeDump,
     },
@@ -500,6 +516,175 @@ describe("harness HTTP API", () => {
     }
   });
 
+  it("returns the canonical stored user message for direct and channel sends", async () => {
+    const created = await api("POST", "/api/bots", {
+      modelSelection: { instanceId: "claude", model: "claude-sonnet-5" },
+      requireAvailableModel: true,
+    });
+    expect(created.status).toBe(201);
+    const bot = created.body.bot;
+    let room: any;
+    try {
+      const direct = await api("POST", `/api/bots/${bot.id}/messages`, { text: "canonical direct" });
+      expect(direct.status).toBe(202);
+      expect(direct.body).toMatchObject({
+        ok: true,
+        threadId: bot.threadId,
+        message: {
+          id: expect.any(String),
+          at: expect.any(Number),
+          role: "user",
+          kind: "text",
+          text: "canonical direct",
+        },
+      });
+      const afterDirect = (await api("GET", "/api/bots?messages=20")).body.bots.find(
+        (candidate: { id: string }) => candidate.id === bot.id,
+      );
+      expect(afterDirect.messages.find((message: { id: string }) => message.id === direct.body.message.id))
+        .toEqual(direct.body.message);
+
+      expect((await api("POST", `/api/bots/${bot.id}/interrupt`)).status).toBe(200);
+      await expect.poll(async () => {
+        const state = (await api("GET", "/api/bots?messages=0")).body;
+        return state.bots.find((candidate: { id: string }) => candidate.id === bot.id)?.busy;
+      }, { timeout: 5_000 }).toBe(false);
+
+      room = (await api("POST", "/api/groups", {
+        name: "Canonical response room",
+        memberIds: [bot.id],
+        setup: { bulletin: "", defaultResponder: { kind: "mentions" } },
+      })).body.group;
+      const channel = await api("POST", `/api/groups/${room.id}/messages`, { text: "canonical channel" });
+      expect(channel.status).toBe(202);
+      expect(channel.body).toMatchObject({
+        ok: true,
+        threadId: room.threadId,
+        message: {
+          id: expect.any(String),
+          at: expect.any(Number),
+          role: "user",
+          kind: "text",
+          text: "canonical channel",
+        },
+      });
+      const afterChannel = (await api("GET", "/api/bots?messages=20")).body.groups.find(
+        (candidate: { id: string }) => candidate.id === room.id,
+      );
+      expect(afterChannel.messages.find((message: { id: string }) => message.id === channel.body.message.id))
+        .toEqual(channel.body.message);
+    } finally {
+      if (room) await api("DELETE", `/api/groups/${room.id}`);
+      await api("POST", `/api/bots/${bot.id}/interrupt`).catch(() => undefined);
+      await api("DELETE", `/api/bots/${bot.id}`);
+    }
+  });
+
+  it("deduplicates direct send retries by sendId, including after the accepted task becomes inactive", async () => {
+    const created = await api("POST", "/api/bots", {
+      modelSelection: { instanceId: "claude", model: "claude-sonnet-5" },
+      requireAvailableModel: true,
+    });
+    expect(created.status).toBe(201);
+    const bot = created.body.bot;
+    const originalThreadId = bot.threadId;
+    const sendId = "direct_retry_1234567890";
+    const request = { text: "retry this direct message once", threadId: originalThreadId, sendId };
+    try {
+      const first = await api("POST", `/api/bots/${bot.id}/messages`, request);
+      expect(first.status).toBe(202);
+      expect(first.body).toMatchObject({
+        ok: true,
+        threadId: originalThreadId,
+        message: { role: "user", kind: "text", text: request.text, sendId },
+      });
+
+      const duplicate = await api("POST", `/api/bots/${bot.id}/messages`, request);
+      expect(duplicate.status).toBe(202);
+      expect(duplicate.body).toEqual(first.body);
+
+      const conflict = await api("POST", `/api/bots/${bot.id}/messages`, {
+        ...request,
+        text: "a different message cannot reuse that identity",
+      });
+      expect(conflict.status).toBe(409);
+      expect(conflict.body.error).toMatch(/sendId already belongs/i);
+
+      const invalid = await api("POST", `/api/bots/${bot.id}/messages`, {
+        text: "invalid identity must not land",
+        threadId: originalThreadId,
+        sendId: "short",
+      });
+      expect(invalid.status).toBe(400);
+
+      const accepted = (await api("GET", "/api/bots?messages=50")).body.bots.find(
+        (candidate: { id: string }) => candidate.id === bot.id,
+      );
+      expect(accepted.messages.filter((message: { role: string; sendId?: string }) =>
+        message.role === "user" && message.sendId === sendId
+      )).toHaveLength(1);
+      expect(accepted.messages.some((message: { text?: string }) => message.text === "invalid identity must not land"))
+        .toBe(false);
+
+      await api("POST", `/api/bots/${bot.id}/interrupt`, { threadId: originalThreadId });
+      await expect.poll(async () => {
+        const state = (await api("GET", "/api/bots?messages=0")).body.bots.find(
+          (candidate: { id: string }) => candidate.id === bot.id,
+        );
+        return state?.busy;
+      }, { timeout: 5_000 }).toBe(false);
+
+      const nextTask = await api("POST", `/api/bots/${bot.id}/tasks`, { title: "Now active" });
+      expect(nextTask.status).toBe(201);
+      expect(nextTask.body.task.threadId).not.toBe(originalThreadId);
+
+      const inactiveRetry = await api("POST", `/api/bots/${bot.id}/messages`, request);
+      expect(inactiveRetry.status).toBe(202);
+      expect(inactiveRetry.body).toEqual(first.body);
+      const current = (await api("GET", "/api/bots?messages=0")).body.bots.find(
+        (candidate: { id: string }) => candidate.id === bot.id,
+      );
+      expect(current.threadId).toBe(nextTask.body.task.threadId);
+    } finally {
+      await api("POST", `/api/bots/${bot.id}/interrupt`, {}).catch(() => undefined);
+      await api("DELETE", `/api/bots/${bot.id}`);
+    }
+  });
+
+  it("deduplicates channel send retries by sendId", async () => {
+    const member = (await api("GET", "/api/bots?messages=0")).body.bots[0];
+    const room = (await api("POST", "/api/groups", {
+      name: "Idempotent channel",
+      memberIds: [member.id],
+      setup: { bulletin: "", defaultResponder: { kind: "mentions" } },
+    })).body.group;
+    const sendId = "channel_retry_123456789";
+    const request = { text: "one canonical channel message", threadId: room.threadId, sendId };
+    try {
+      const first = await api("POST", `/api/groups/${room.id}/messages`, request);
+      expect(first.status).toBe(202);
+      expect(first.body).toMatchObject({
+        ok: true,
+        threadId: room.threadId,
+        message: { role: "user", kind: "text", text: request.text, sendId },
+      });
+
+      const duplicate = await api("POST", `/api/groups/${room.id}/messages`, request);
+      expect(duplicate.status).toBe(202);
+      expect(duplicate.body).toEqual(first.body);
+
+      const snapshot = (await api("GET", "/api/bots?messages=50")).body.groups.find(
+        (candidate: { id: string }) => candidate.id === room.id,
+      );
+      expect(snapshot.messages.filter((message: { role: string; sendId?: string }) =>
+        message.role === "user" && message.sendId === sendId
+      )).toHaveLength(1);
+    } finally {
+      await api("POST", `/api/groups/${room.id}/interrupt`, {}).catch(() => undefined);
+      await api("DELETE", `/api/groups/${room.id}`);
+    }
+  });
+
   it("rejects an entire channel roster when any requested member is unknown", async () => {
     const bot = (await api("GET", "/api/bots?messages=0")).body.bots[0];
     const before = (await api("GET", "/api/bots?messages=0")).body.groups.length;
@@ -557,9 +742,105 @@ describe("harness HTTP API", () => {
       expect(removed.body.group.tasks).toHaveLength(1);
       expect((await api("DELETE", `/api/groups/${room.id}/tasks/${originalThread}`)).status).toBe(400);
       expect((await api("POST", `/api/groups/${room.id}/tasks/missing-thread`)).status).toBe(404);
+      expect((await api("POST", `/api/groups/${room.id}/tasks`, { title: 42 })).status).toBe(400);
     } finally {
       await api("DELETE", `/api/groups/${room.id}`);
       await api("DELETE", `/api/bots/${bot.id}`);
+    }
+  });
+
+  it("lets a Chief create operators from its direct and channel tasks but not from channels it cannot access", async () => {
+    const chief = (await api("POST", "/api/bots")).body.bot;
+    const outsider = (await api("POST", "/api/bots")).body.bot;
+    let channel: any;
+    let outsiderChannel: any;
+    const createdBotIds: string[] = [];
+    try {
+      const selected = await api("PATCH", `/api/bots/${chief.id}`, {
+        name: "Channel Chief",
+        section: "Channel creation test",
+        chiefOfStaff: true,
+        modelSelection: { instanceId: "claude", model: "claude-sonnet-5" },
+      });
+      expect(selected.status).toBe(200);
+
+      rmSync(fakeClaudeDump, { force: true });
+      expect((await api("POST", `/api/bots/${chief.id}/messages`, { text: "prepare the team" })).status).toBe(202);
+      await expect.poll(() => existsSync(fakeClaudeDump), { timeout: 5_000 }).toBe(true);
+      const dump = z.object({
+        mcpConfig: z.object({
+          mcpServers: z.object({
+            agents: z.object({ env: z.object({ OMB_COMMS_TOKEN: z.string() }) }),
+          }),
+        }),
+      }).parse(JSON.parse(readFileSync(fakeClaudeDump, "utf8")));
+      const internalHeaders = {
+        authorization: `Bearer ${dump.mcpConfig.mcpServers.agents.env.OMB_COMMS_TOKEN}`,
+        "content-type": "application/json",
+      };
+      expect((await api("POST", `/api/bots/${chief.id}/interrupt`)).status).toBe(200);
+
+      const createOperator = async (fromThreadId: string, name: string, fromBotId = chief.id) => {
+        const response = await fetch(`${BASE}/api/internal/create-bot`, {
+          method: "POST",
+          headers: internalHeaders,
+          body: JSON.stringify({
+            fromBotId,
+            fromThreadId,
+            name,
+            role: "Research operator",
+            instructions: "Research the assigned question and report concise findings.",
+          }),
+        });
+        const body = z.object({
+          id: z.string().optional(),
+          section: z.string().optional(),
+          error: z.string().optional(),
+        }).passthrough().parse(await response.json());
+        if (response.status === 201 && body.id) createdBotIds.push(body.id);
+        return { status: response.status, body };
+      };
+
+      const direct = await createOperator(chief.threadId, "Direct Task Operator");
+      expect(direct).toMatchObject({ status: 201, body: { section: "Channel creation test" } });
+
+      channel = (await api("POST", "/api/groups", {
+        name: "Chief member channel",
+        memberIds: [chief.id],
+        setup: { bulletin: "", defaultResponder: { kind: "member", botId: chief.id } },
+      })).body.group;
+      const rootThreadId = channel.threadId;
+      const channelTask = await api("POST", `/api/groups/${channel.id}/tasks`, { title: "Research task" });
+      expect(channelTask.status).toBe(201);
+      const rootTask = await createOperator(rootThreadId, "Channel Root Operator");
+      expect(rootTask.status).toBe(201);
+      const nestedTask = await createOperator(channelTask.body.task.threadId, "Channel Task Operator");
+      expect(nestedTask.status).toBe(201);
+
+      outsiderChannel = (await api("POST", "/api/groups", {
+        name: "Outsider-only channel",
+        memberIds: [outsider.id],
+        setup: { bulletin: "", defaultResponder: { kind: "member", botId: outsider.id } },
+      })).body.group;
+      const nonChief = await createOperator(outsiderChannel.threadId, "Non-Chief Operator", outsider.id);
+      expect(nonChief).toEqual({
+        status: 403,
+        body: { error: "only a section's Chief of Staff can create operator bots" },
+      });
+      const denied = await createOperator(outsiderChannel.threadId, "Forbidden Operator");
+      expect(denied).toEqual({
+        status: 403,
+        body: { error: "source conversation does not belong to sender" },
+      });
+      const state = (await api("GET", "/api/bots?messages=0")).body;
+      expect(state.bots.some((bot: { name: string }) => bot.name === "Forbidden Operator")).toBe(false);
+    } finally {
+      await api("POST", `/api/bots/${chief.id}/interrupt`);
+      if (outsiderChannel?.id) await api("DELETE", `/api/groups/${outsiderChannel.id}`);
+      if (channel?.id) await api("DELETE", `/api/groups/${channel.id}`);
+      for (const botId of createdBotIds) await api("DELETE", `/api/bots/${botId}`);
+      await api("DELETE", `/api/bots/${outsider.id}`);
+      await api("DELETE", `/api/bots/${chief.id}`);
     }
   });
 
@@ -2046,20 +2327,20 @@ describe("harness HTTP API", () => {
   it("keeps Teach a skill off by default and persists an explicit opt-in", async () => {
     const before = await api("GET", "/api/config");
     expect(before.status).toBe(200);
-    expect(before.body.features).toEqual({ skillRecorder: false, showToolCalls: false });
+    expect(before.body.features).toEqual({ browser: true, skillRecorder: false, showToolCalls: false });
 
     const saved = await api("PATCH", "/api/config", {
       features: { skillRecorder: true },
     });
     expect(saved.status).toBe(200);
-    expect(saved.body.features).toEqual({ skillRecorder: true, showToolCalls: false });
+    expect(saved.body.features).toEqual({ browser: true, skillRecorder: true, showToolCalls: false });
 
     const disk = JSON.parse(readFileSync(join(home, ".openmausbot", "config.json"), "utf8"));
     expect(disk.features).toEqual({ skillRecorder: true });
 
     const tools = await api("PATCH", "/api/config", { features: { showToolCalls: true } });
     expect(tools.status).toBe(200);
-    expect(tools.body.features).toEqual({ skillRecorder: true, showToolCalls: true });
+    expect(tools.body.features).toEqual({ browser: true, skillRecorder: true, showToolCalls: true });
 
     await api("PATCH", "/api/config", { features: { skillRecorder: false, showToolCalls: false } });
   });
@@ -2292,6 +2573,7 @@ describe("harness HTTP API", () => {
   it("keeps chat-created routines inert until their durable card is confirmed", async () => {
     const bot = (await api("POST", "/api/bots", {})).body.bot;
     let routineId = "";
+    let orphanRoutineId = "";
     let legacyRoutineId = "";
     try {
       const selected = await api("PATCH", `/api/bots/${bot.id}`, {
@@ -2387,7 +2669,11 @@ describe("harness HTTP API", () => {
       }).toEqual(["card-shown:routine", "user-approved:user"]);
 
       const after = await api("GET", "/api/routines");
-      expect(after.body.routines.filter((routine: { botId: string }) => routine.botId === bot.id)).toHaveLength(1);
+      const confirmedRoutine = after.body.routines.find((routine: { id: string }) => routine.id === routineId);
+      expect(confirmedRoutine).toMatchObject({
+        botId: bot.id,
+        sourceThreadId: bot.threadId,
+      });
       const duplicate = await api("POST", `/api/threads/${bot.threadId}/respond`, {
         requestId: proposal.requestId,
         behavior: "allow",
@@ -2395,6 +2681,136 @@ describe("harness HTTP API", () => {
       expect(duplicate.body.alreadySettled).toBe(true);
       expect((await api("GET", "/api/routines")).body.routines
         .filter((routine: { botId: string }) => routine.botId === bot.id)).toHaveLength(1);
+
+      // The initial fixture turn is deliberately hung. Once it is stopped,
+      // force a deterministic dispatch failure by choosing the configured
+      // but unavailable ghost provider. The execution stays detached, while one source card is
+      // appended then patched through queued → running → failed.
+      expect((await api("POST", `/api/bots/${bot.id}/interrupt`)).status).toBe(200);
+      await expect.poll(async () => {
+        const current = (await api("GET", "/api/bots?messages=0")).body.bots
+          .find((candidate: { id: string }) => candidate.id === bot.id);
+        return Boolean(current?.busy);
+      }, { timeout: 5_000 }).toBe(false);
+      expect((await api("PATCH", `/api/bots/${bot.id}`, {
+        modelSelection: { instanceId: "ghost", model: "unavailable-fixture" },
+      })).status).toBe(200);
+
+      const routineEvents = await openSse(`${BASE}/api/events`);
+      try {
+        const queued = await api("POST", `/api/routines/${routineId}/run`);
+        expect(queued.status).toBe(201);
+        const failedNotice = await routineEvents.until(
+          (frame) =>
+            frame.kind === "notify" &&
+            frame.notification?.kind === "routine-failed" &&
+            frame.notification?.botId === bot.id,
+          5_000,
+        );
+        expect(failedNotice.notification.threadId).toBe(bot.threadId);
+
+        await expect.poll(async () => {
+          const current = (await api("GET", "/api/bots")).body.bots
+            .find((candidate: { id: string }) => candidate.id === bot.id);
+          return current?.messages.filter(
+            (message: { kind?: string; routineRun?: { runId?: string } }) =>
+              message.kind === "routine.run" && message.routineRun?.runId === queued.body.run.id,
+          ) ?? [];
+        }, { timeout: 5_000 }).toHaveLength(1);
+        const current = (await api("GET", "/api/bots")).body.bots
+          .find((candidate: { id: string }) => candidate.id === bot.id);
+        const runCards = current.messages.filter(
+          (message: { kind?: string; routineRun?: { runId?: string } }) =>
+            message.kind === "routine.run" && message.routineRun?.runId === queued.body.run.id,
+        );
+        expect(runCards).toHaveLength(1);
+        expect(runCards[0].routineRun).toMatchObject({
+          runId: queued.body.run.id,
+          routineId,
+          routineName: "Weekday brief",
+          status: "failed",
+        });
+        expect(runCards[0].routineRun.executionThreadId).not.toBe(bot.threadId);
+
+        // Reading the source and then marking the failure seen in Routines
+        // must not make the original conversation unread again. markSeen
+        // re-emits the receipt without changing its lifecycle status.
+        expect((await api("POST", `/api/bots/${bot.id}/read`)).status).toBe(200);
+        expect((await api("POST", `/api/routine-runs/${queued.body.run.id}/seen`)).status).toBe(200);
+        const afterSeen = (await api("GET", "/api/bots?messages=0")).body.bots
+          .find((candidate: { id: string }) => candidate.id === bot.id);
+        expect(afterSeen.unread).toBe(false);
+
+        const grounded = await fetch(
+          `${BASE}/api/internal/routines?fromBotId=${encodeURIComponent(bot.id)}&fromThreadId=${encodeURIComponent(bot.threadId)}`,
+          { headers: internalHeaders },
+        );
+        const groundedBody = z.object({
+          routines: z.array(z.object({
+            id: z.string(),
+            latestRun: z.object({
+              status: z.string(),
+              scheduledFor: z.string().nullable(),
+              startedAt: z.string().nullable(),
+              finishedAt: z.string().nullable(),
+              output: z.string().nullable(),
+              error: z.string().nullable(),
+              executionThreadId: z.string().nullable(),
+            }).nullable(),
+          }).passthrough()),
+        }).parse(await grounded.json());
+        expect(groundedBody.routines.find((routine) => routine.id === routineId)?.latestRun).toMatchObject({
+          status: "failed",
+          startedAt: expect.any(String),
+          finishedAt: expect.any(String),
+          error: expect.stringMatching(/provider instance "ghost" is unavailable/i),
+          executionThreadId: runCards[0].routineRun.executionThreadId,
+        });
+      } finally {
+        routineEvents.close();
+      }
+
+      // A deleted source conversation is a safe fallback, not an instruction
+      // to recreate its transcript. The run still gets its detached receipt
+      // and failure, but no lifecycle message is written to the orphan id.
+      const orphanSource = await api("POST", `/api/bots/${bot.id}/tasks`, { title: "Temporary routine source" });
+      expect(orphanSource.status).toBe(201);
+      const orphanThreadId = z.object({
+        task: z.object({ threadId: z.string() }),
+      }).parse(orphanSource.body).task.threadId;
+      const orphanProposalResponse = await fetch(`${BASE}/api/internal/routine-requests`, {
+        method: "POST",
+        headers: internalHeaders,
+        body: JSON.stringify({
+          fromBotId: bot.id,
+          fromThreadId: orphanThreadId,
+          action: "create",
+          routine: {
+            name: "Orphan-safe brief",
+            instructions: "Summarize without recreating the deleted source.",
+            schedule: { type: "weekly", time: "09:00", weekdays: ["monday"] },
+            runOn: "maus",
+          },
+        }),
+      });
+      expect(orphanProposalResponse.status).toBe(201);
+      const orphanProposal = z.object({ requestId: z.string() }).parse(await orphanProposalResponse.json());
+      const orphanConfirmed = await api("POST", `/api/threads/${orphanThreadId}/respond`, {
+        requestId: orphanProposal.requestId,
+        behavior: "allow",
+      });
+      expect(orphanConfirmed.status).toBe(200);
+      orphanRoutineId = orphanConfirmed.body.resultId;
+      expect((await api("DELETE", `/api/bots/${bot.id}/tasks/${orphanThreadId}`)).status).toBe(200);
+      expect(storedMessageCount(orphanThreadId)).toBe(0);
+
+      const orphanRun = await api("POST", `/api/routines/${orphanRoutineId}/run`);
+      expect(orphanRun.status).toBe(201);
+      await expect.poll(async () => {
+        const runs = (await api("GET", "/api/routines")).body.runs;
+        return runs.find((run: { id: string }) => run.id === orphanRun.body.run.id)?.status;
+      }, { timeout: 5_000 }).toBe("failed");
+      expect(storedMessageCount(orphanThreadId)).toBe(0);
 
       // Calendar-created routines may predate chat-card redaction. Listing
       // them to a model must redact the whole prompt before returning its
@@ -2441,6 +2857,7 @@ describe("harness HTTP API", () => {
       expect(wrongThread.status).toBe(403);
     } finally {
       if (legacyRoutineId) await api("DELETE", `/api/routines/${legacyRoutineId}`);
+      if (orphanRoutineId) await api("DELETE", `/api/routines/${orphanRoutineId}`);
       if (routineId) await api("DELETE", `/api/routines/${routineId}`);
       await api("POST", `/api/bots/${bot.id}/interrupt`);
       await api("DELETE", `/api/bots/${bot.id}`);
@@ -2962,6 +3379,31 @@ describe("resumable event stream", () => {
     }
   });
 
+  it("sends browser-visible heartbeats without moving the replay cursor", async () => {
+    const { body } = await api("GET", "/api/bots");
+    const botId = body.bots[0].id;
+    const first = await openSse(`${BASE}/api/events`);
+    const hello = await first.until((frame) => frame.kind === "hello");
+    try {
+      expect(await first.until((frame) => frame.kind === "ping")).toEqual({ kind: "ping" });
+      await nudge(botId);
+      const next = await first.until((frame) => frame.kind === "bot" && frame.bot?.id === botId);
+      expect(next.seq).toBe(Number(hello.cursor.split(":")[1]) + 1);
+    } finally {
+      first.close();
+    }
+
+    // Heartbeats describe connection health, not application state. A
+    // reconnect from the numbered application frame remains fully resumable.
+    const cursor = `${hello.cursor.split(":")[0]}:${Number(hello.cursor.split(":")[1]) + 1}`;
+    const resumed = await openSse(`${BASE}/api/events?since=${encodeURIComponent(cursor)}`);
+    try {
+      expect((await resumed.until((frame) => frame.kind === "hello")).resumed).toBe(true);
+    } finally {
+      resumed.close();
+    }
+  });
+
   it("replays exactly what a disconnected client missed", async () => {
     const { body } = await api("GET", "/api/bots");
     const botId = body.bots[0].id;
@@ -3007,6 +3449,33 @@ describe("resumable event stream", () => {
     try {
       expect((await resumed.until((f) => f.kind === "hello")).resumed).toBe(true);
       await resumed.until((f) => f.kind === "bot");
+    } finally {
+      resumed.close();
+    }
+  });
+
+  it("prefers a newer Last-Event-ID over the EventSource URL's stale cursor", async () => {
+    const { body } = await api("GET", "/api/bots");
+    const botId = body.bots[0].id;
+
+    const first = await openSse(`${BASE}/api/events`);
+    const hello = await first.until((frame) => frame.kind === "hello");
+    await nudge(botId);
+    const seen = await first.until((frame) => frame.kind === "bot" && frame.bot?.id === botId);
+    first.close();
+    await nudge(botId);
+
+    // Native EventSource reconnects reuse their original URL, including its
+    // old query, but add Last-Event-ID for the newest numbered frame seen.
+    const resumed = await openSse(
+      `${BASE}/api/events?since=${encodeURIComponent(hello.cursor)}`,
+      { "last-event-id": `${hello.cursor.split(":")[0]}:${seen.seq}` },
+    );
+    try {
+      expect((await resumed.until((frame) => frame.kind === "hello")).resumed).toBe(true);
+      await resumed.until((frame) => frame.kind === "bot" && frame.bot?.id === botId);
+      const replayed = resumed.frames.filter((frame) => frame.kind === "bot" && frame.bot?.id === botId);
+      expect(replayed.map((frame) => frame.seq)).toEqual([seen.seq + 1]);
     } finally {
       resumed.close();
     }
