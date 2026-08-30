@@ -119,7 +119,11 @@ function driveMcp(
       jsonrpc: "2.0",
       id: 1,
       method: "initialize",
-      params: { protocolVersion: "2024-11-05" },
+      params: {
+        protocolVersion: "2024-11-05",
+        capabilities: {},
+        clientInfo: { name: "openmausbot-fake-antigravity", version: "1.0.0" },
+      },
     });
   });
 }
