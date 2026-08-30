@@ -24,3 +24,6 @@ cloudflare/control-plane/worker-configuration.d.ts
 .claude/worktrees/
 .vercel/
 .pi/
+
+# Private product and pricing notes
+proplan.md
