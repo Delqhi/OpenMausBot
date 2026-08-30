@@ -92,6 +92,7 @@ const computerControlSnapshotSchema = z.object({
 }).passthrough();
 
 function routineScheduleLabel(routine: Routine) {
+  if (routine.schedule.type === "startup") return "On app start";
   if (routine.schedule.type === "once") {
     return new Date(routine.schedule.at).toLocaleString([], {
       month: "short",
@@ -111,9 +112,11 @@ function routineScheduleLabel(routine: Routine) {
   return `${cadence} · ${new Date(2000, 0, 1, hour, minute).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })}`;
 }
 
-function nextRunLabel(at: number | null) {
-  if (at == null) return "Paused";
-  const date = new Date(at);
+function nextRunLabel(routine: Routine) {
+  if (!routine.enabled) return "Paused";
+  if (routine.schedule.type === "startup") return "Next app start";
+  if (routine.nextRunAt == null) return "Not scheduled";
+  const date = new Date(routine.nextRunAt);
   const today = new Date();
   const sameDay = date.toDateString() === today.toDateString();
   return `${sameDay ? "Today" : date.toLocaleDateString([], { month: "short", day: "numeric" })}, ${date.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })}`;
@@ -1340,7 +1343,7 @@ export function ComputerPanel({
                       {routineScheduleLabel(routine)}{routine.runOn === "cloud" ? " · runs on VM" : ""}
                     </span>
                   </span>
-                  <span className="shrink-0 text-[10px] text-ink-secondary">{nextRunLabel(routine.nextRunAt)}</span>
+                  <span className="shrink-0 text-[10px] text-ink-secondary">{nextRunLabel(routine)}</span>
                 </button>
               ))}
             </div>

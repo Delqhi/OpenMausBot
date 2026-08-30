@@ -2876,8 +2876,6 @@ if (recoveryOwners.length > 0) {
     ),
   );
 }
-routines.start();
-
 // Chat tools can prepare routine changes, but the harness applies them only
 // after the user confirms a durable card. Keeping this beside the scheduler
 // makes the card resolvable after an app restart without involving the model.
@@ -2944,11 +2942,13 @@ const agentRoutine = (
     durationMinutes: routine.durationMinutes,
     schedule: routine.schedule.type === "once"
       ? { type: "once" as const, at: new Date(routine.schedule.at).toISOString() }
-      : {
-          type: "weekly" as const,
-          time: routine.schedule.time,
-          weekdays: routine.schedule.weekdays.map((day) => ROUTINE_WEEKDAY_NAMES[day]),
-        },
+      : routine.schedule.type === "startup"
+        ? { type: "startup" as const }
+        : {
+            type: "weekly" as const,
+            time: routine.schedule.time,
+            weekdays: routine.schedule.weekdays.map((day) => ROUTINE_WEEKDAY_NAMES[day]),
+          },
     nextRunAt: routine.nextRunAt === null ? null : new Date(routine.nextRunAt).toISOString(),
     latestRun: latestRun
       ? {
@@ -7748,6 +7748,7 @@ const server = createServer(async (req, res) => {
 
 server.listen(PORT, "127.0.0.1", () => {
   console.log(`openmausbot server on http://127.0.0.1:${PORT}`);
+  routines?.start();
 });
 
 const gracefulShutdown = createGracefulShutdown({

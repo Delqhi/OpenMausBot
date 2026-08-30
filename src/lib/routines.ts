@@ -1,10 +1,11 @@
 export type RoutineSchedule =
   | { type: "once"; at: number }
-  | { type: "daily"; time: string; weekdays: number[] };
+  | { type: "daily"; time: string; weekdays: number[] }
+  | { type: "startup" };
 
 export type RoutineRunOn = "maus" | "cloud";
 
-export type RoutineRunTrigger = "schedule" | "manual" | "webhook";
+export type RoutineRunTrigger = "schedule" | "startup" | "manual" | "webhook";
 
 export type RoutineRunStatus =
   | "queued"

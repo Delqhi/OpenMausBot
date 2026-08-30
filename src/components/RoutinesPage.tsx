@@ -13,6 +13,7 @@ import {
   Pause,
   Play,
   Plus,
+  Power,
   Trash2,
   Webhook,
   X,
@@ -80,6 +81,7 @@ function niceTime(at: number) {
 }
 
 function scheduleLabel(routine: Routine) {
+  if (routine.schedule.type === "startup") return "On app start";
   if (routine.schedule.type === "once") {
     return `${niceDate(routine.schedule.at)}, ${niceTime(routine.schedule.at)}`;
   }
@@ -94,7 +96,7 @@ function scheduleLabel(routine: Routine) {
 }
 
 function canToggleRoutine(routine: Routine) {
-  return routine.schedule.type === "daily" || routine.schedule.at > Date.now();
+  return routine.schedule.type === "startup" || routine.schedule.type === "daily" || routine.schedule.at > Date.now();
 }
 
 function statusState(status: RoutineRunStatus): MausState {
@@ -159,6 +161,9 @@ function projectedItems(routines: Routine[], runs: RoutineRun[], from: number, t
 
   for (const routine of routines) {
     if (!routine.enabled) continue;
+    // Startup routines have no future wall-clock occurrence to draw. Their
+    // real launch receipts still appear in the calendar at the time they ran.
+    if (routine.schedule.type === "startup") continue;
     if (routine.schedule.type === "once") {
       const at = routine.schedule.at;
       if (at >= from && at < to && !hasReceipt(routine.id, at)) {
@@ -319,7 +324,7 @@ export function RoutineEditor({
   const [prompt, setPrompt] = useState(routine?.prompt ?? "");
   const [botId, setBotId] = useState(lockedBotId ?? routine?.botId ?? bots[0]?.id ?? "");
   const [runOn, setRunOn] = useState<RoutineRunOn>(routine?.runOn ?? defaultRunOn ?? "maus");
-  const [kind, setKind] = useState<"once" | "daily">(routine?.schedule.type ?? "daily");
+  const [kind, setKind] = useState<"once" | "daily" | "startup">(routine?.schedule.type ?? "daily");
   const [at, setAt] = useState(
     toInputDateTime(routine?.schedule.type === "once" ? routine.schedule.at : nextHour()),
   );
@@ -344,7 +349,9 @@ export function RoutineEditor({
       schedule:
         kind === "once"
           ? { type: "once", at: new Date(at).getTime() }
-          : { type: "daily", time, weekdays },
+          : kind === "startup"
+            ? { type: "startup" }
+            : { type: "daily", time, weekdays },
     };
     setSaving(true);
     setError("");
@@ -431,13 +438,13 @@ export function RoutineEditor({
           <div>
             <div className="mb-2 text-[12px] font-medium text-ink-secondary">When?</div>
             <div className="mb-3 inline-flex rounded-xl bg-inset p-1">
-              {(["once", "daily"] as const).map((value) => (
-                <button key={value} onClick={() => setKind(value)} className={cn("rounded-lg px-4 py-1.5 text-[13px] capitalize", kind === value ? "bg-raised text-ink shadow" : "text-ink-secondary hover:text-ink")}>{value === "daily" ? "Repeating" : "Once"}</button>
+              {(["once", "daily", "startup"] as const).map((value) => (
+                <button key={value} onClick={() => setKind(value)} className={cn("rounded-lg px-4 py-1.5 text-[13px]", kind === value ? "bg-raised text-ink shadow" : "text-ink-secondary hover:text-ink")}>{value === "daily" ? "Repeating" : value === "startup" ? "On app start" : "Once"}</button>
               ))}
             </div>
             {kind === "once" ? (
               <input type="datetime-local" value={at} onChange={(event) => setAt(event.target.value)} className="block rounded-xl border border-hairline/60 bg-inset px-3.5 py-2.5 text-[14px] text-ink outline-none focus:border-accent/70 [color-scheme:dark]" />
-            ) : (
+            ) : kind === "daily" ? (
               <div className="space-y-3">
                 <input type="time" value={time} onChange={(event) => setTime(event.target.value)} className="rounded-xl border border-hairline/60 bg-inset px-3.5 py-2.5 text-[14px] text-ink outline-none focus:border-accent/70 [color-scheme:dark]" />
                 <div className="flex flex-wrap gap-1.5">
@@ -445,6 +452,11 @@ export function RoutineEditor({
                     <button key={label} type="button" onClick={() => setWeekdays((current) => current.includes(day) ? (current.length === 1 ? current : current.filter((value) => value !== day)) : [...current, day].sort())} className={cn("size-10 rounded-xl border text-[11px] font-medium", weekdays.includes(day) ? "border-accent bg-accent text-white" : "border-hairline/50 bg-inset text-ink-secondary hover:text-ink")}>{label.slice(0, 2)}</button>
                   ))}
                 </div>
+              </div>
+            ) : (
+              <div className="flex items-start gap-2 rounded-xl border border-accent/20 bg-accent/5 px-3.5 py-3 text-[12px] leading-relaxed text-ink-secondary">
+                <Power size={15} className="mt-0.5 shrink-0 text-accent" />
+                Runs once each time OpenMausBot starts. Creating, editing, or resuming it arms the next launch; use Run now if you want it immediately.
               </div>
             )}
           </div>
@@ -602,6 +614,10 @@ export function RoutinesPage() {
   const unseenFailures = state.routineRuns.filter((run) => ["failed", "missed"].includes(run.status) && !run.seenAt).length;
   const running = state.routineRuns.filter((run) => ["queued", "running", "waiting"].includes(run.status)).length;
   const paused = state.routines.filter((routine) => !routine.enabled && canToggleRoutine(routine));
+  const startupRoutines = state.routines.filter(
+    (routine) => routine.enabled && routine.schedule.type === "startup" &&
+      (botFilter === "all" || routine.botId === botFilter),
+  );
   useEffect(() => {
     if (pausedOpen && paused.length === 0) setPausedOpen(false);
   }, [pausedOpen, paused.length]);
@@ -664,6 +680,32 @@ export function RoutinesPage() {
             {([1, 3, 7] as const).map((days) => <button key={days} onClick={() => { setViewDays(days); setAnchor(days === 7 ? startOfWeek(anchor) : startOfDay(anchor)); }} className={cn("rounded-lg px-3 py-1.5 text-[11px] font-medium", viewDays === days ? "bg-raised text-ink shadow" : "text-ink-secondary hover:text-ink")}>{days === 1 ? "Day" : days === 3 ? "3 days" : "Week"}</button>)}
           </div>
         </div>}
+        {section === "calendar" && startupRoutines.length > 0 && (
+          <div className="mt-3 rounded-xl border border-accent/20 bg-accent/5 p-3">
+            <div className="mb-2 flex items-center gap-2 text-[11.5px] font-medium text-ink">
+              <Power size={13} className="text-accent" />On app start
+              <span className="font-normal text-ink-secondary">Runs once on each new app launch</span>
+            </div>
+            <div className="flex flex-wrap gap-2">
+              {startupRoutines.map((routine) => {
+                const bot = state.bots.find((candidate) => candidate.id === routine.botId);
+                return (
+                  <button
+                    key={routine.id}
+                    onClick={() => setEditor(routine)}
+                    className="flex min-w-0 items-center gap-2 rounded-lg border border-hairline/45 bg-panel px-2.5 py-2 text-left hover:bg-raised"
+                  >
+                    {bot && <BotAvatar bot={bot} state="idle" size={30} animated={false} label={bot.name} />}
+                    <span className="min-w-0">
+                      <span className="block max-w-52 truncate text-[12px] font-medium text-ink">{routine.name}</span>
+                      <span className="block max-w-52 truncate text-[10.5px] text-ink-secondary">{bot?.name ?? "Deleted MAUS"} · Next app start</span>
+                    </span>
+                  </button>
+                );
+              })}
+            </div>
+          </div>
+        )}
       </header>
 
       {section === "webhooks" ? (

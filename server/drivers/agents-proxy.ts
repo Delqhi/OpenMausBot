@@ -56,12 +56,12 @@ const ROUTINE_SCHEDULE_SCHEMA = {
   type: "object",
   additionalProperties: false,
   description:
-    'Either {"type":"once","at":RFC3339} for one future run, {"type":"weekly","time":"HH:MM","weekdays":[...]} for chosen days, or {"type":"daily","time":"HH:MM"} to run every day. Sub-day intervals (every N minutes/hours) are not supported.',
+    'Either {"type":"once","at":RFC3339} for one future run, {"type":"weekly","time":"HH:MM","weekdays":[...]} for chosen days, {"type":"daily","time":"HH:MM"} to run every day, or {"type":"startup"} to run once on each new OpenMausBot app launch. Sub-day intervals (every N minutes/hours) are not supported.',
   properties: {
     type: {
       type: "string",
-      enum: ["once", "weekly", "daily"],
-      description: "once = a single future run; weekly = chosen weekdays; daily = every day of the week.",
+      enum: ["once", "weekly", "daily", "startup"],
+      description: "once = a single future run; weekly = chosen weekdays; daily = every day of the week; startup = once on each new app launch.",
     },
     at: {
       type: "string",
@@ -96,7 +96,8 @@ const SHORT_WEEKDAYS = {
 
 const SUPPORTED_SCHEDULES =
   'Supported schedules: {"type":"once","at":"2026-09-01T09:00:00+05:30"} (future RFC3339 with explicit offset), ' +
-  '{"type":"weekly","time":"09:00","weekdays":["monday","friday"]}, or {"type":"daily","time":"09:00"} for every day.';
+  '{"type":"weekly","time":"09:00","weekdays":["monday","friday"]}, {"type":"daily","time":"09:00"} for every day, ' +
+  'or {"type":"startup"} for once on each new OpenMausBot app launch.';
 
 /** The outcome of coercing a model-sent schedule: the harness-dialect
  * schedule, or a message telling the model exactly what to send instead. */
@@ -127,6 +128,7 @@ function normalizeScheduleInput(args: Json): NormalizedSchedule {
     }
     return { schedule: { type: "once", at: raw.at.trim() } };
   }
+  if (type === "startup") return { schedule: { type: "startup" } };
   if (type === "weekly" || type === "daily") {
     const time = typeof raw.time === "string" ? raw.time.trim() : "";
     if (!time) return { error: `A ${type} schedule needs "time" in 24-hour HH:MM, for example 09:00.` };

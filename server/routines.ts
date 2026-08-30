@@ -10,7 +10,8 @@ import type { RoutineRequestOperation } from "../shared/routine-request.ts";
 
 export type RoutineSchedule =
   | { type: "once"; at: number }
-  | { type: "daily"; time: string; weekdays: number[] };
+  | { type: "daily"; time: string; weekdays: number[] }
+  | { type: "startup" };
 
 /** `cloud` runs the agent itself inside the bot's Box VM. `maus` keeps
  * using the provider selected on the MAUS and only borrows its configured
@@ -19,7 +20,7 @@ export type RoutineRunOn = "maus" | "cloud";
 
 const persistedSourceThreadId = z.string().trim().min(1).optional().catch(undefined);
 
-export type RoutineRunTrigger = "schedule" | "manual" | "webhook";
+export type RoutineRunTrigger = "schedule" | "startup" | "manual" | "webhook";
 
 export type RoutineRunStatus =
   | "queued"
@@ -184,11 +185,13 @@ function cleanSchedule(schedule: RoutineSchedule): RoutineSchedule {
     if (!/^([01]\d|2[0-3]):[0-5]\d$/.test(time)) throw new Error("Time must use HH:MM");
     return { type: "daily", time, weekdays: cleanDays(schedule.weekdays) };
   }
+  if (schedule?.type === "startup") return { type: "startup" };
   throw new Error("Choose a supported schedule");
 }
 
 /** Next wall-clock occurrence in this computer's timezone, strictly after `after`. */
 export function nextOccurrence(schedule: RoutineSchedule, after: number): number | null {
+  if (schedule.type === "startup") return null;
   if (schedule.type === "once") return schedule.at > after ? schedule.at : null;
   const [hour, minute] = schedule.time.split(":").map(Number);
   const weekdays = new Set(cleanDays(schedule.weekdays));
@@ -230,19 +233,29 @@ export class RoutineManager {
   private routineRequestReceipts: RoutineRequestReceipt[] = [];
   private timer: ReturnType<typeof setInterval> | null = null;
   private ticking = false;
+  private startupArmed = false;
 
   constructor(options: RoutineManagerOptions) {
     this.options = options;
     this.file = options.file ?? join(DATA_DIR, "routines.json");
     this.now = options.now ?? Date.now;
+    let normalizedStartupSchedule = false;
     try {
       const disk = JSON.parse(readFileSync(this.file, "utf8")) as Partial<RoutineFile>;
       this.routines = Array.isArray(disk.routines)
-        ? disk.routines.map((routine) => ({
-            ...routine,
-            runOn: routine.runOn ?? "maus",
-            sourceThreadId: persistedSourceThreadId.parse(routine.sourceThreadId),
-          }))
+        ? disk.routines.map((routine) => {
+            const startup = routine.schedule?.type === "startup";
+            if (startup && routine.nextRunAt !== null) normalizedStartupSchedule = true;
+            return {
+              ...routine,
+              runOn: routine.runOn ?? "maus",
+              sourceThreadId: persistedSourceThreadId.parse(routine.sourceThreadId),
+              // Startup routines do not have a calendar occurrence. Older or
+              // manually edited files may carry a stale value; normalize it
+              // before exposing the definition or arming this process launch.
+              nextRunAt: startup ? null : routine.nextRunAt,
+            };
+          })
         : [];
       this.runs = Array.isArray(disk.runs)
         ? disk.runs.map((run) => ({
@@ -268,9 +281,11 @@ export class RoutineManager {
       this.routines = [];
       this.runs = [];
       this.routineRequestReceipts = [];
+      normalizedStartupSchedule = false;
     }
     // A local process cannot still own these turns after a full restart.
     const recovered: RoutineRun[] = [];
+    const cancelledStartupRuns: RoutineRun[] = [];
     for (const run of this.runs) {
       if (run.status === "running" || run.status === "waiting") {
         run.status = "failed";
@@ -278,15 +293,44 @@ export class RoutineManager {
         run.attention = undefined;
         run.finishedAt = this.now();
         recovered.push({ ...run });
+      } else if (run.status === "queued" && run.triggerSource === "startup") {
+        // Startup triggers are launch-scoped. If the previous process stopped
+        // before dispatch, carrying its queued receipt into this launch would
+        // stack duplicate work beside the fresh trigger below.
+        run.status = "cancelled";
+        run.error = "OpenMausBot restarted before this app-start routine began";
+        run.attention = undefined;
+        run.finishedAt = this.now();
+        cancelledStartupRuns.push({ ...run });
       }
     }
-    if (recovered.length > 0) {
+    if (
+      recovered.length > 0 ||
+      cancelledStartupRuns.length > 0 ||
+      normalizedStartupSchedule
+    ) {
       this.save();
       for (const run of recovered) {
         this.notifyRunChanged(run);
         this.options.onRunFailed?.(run);
       }
+      for (const run of cancelledStartupRuns) this.notifyRunChanged(run);
     }
+  }
+
+  /** Arm launch-scoped routines only after the harness has successfully bound
+   * its listener. Packaged Electron may fork and discard several candidate
+   * children while resolving a port; constructors in those losing processes
+   * must never count as app launches or dispatch user work. */
+  armStartup(): void {
+    if (this.startupArmed) return;
+    this.startupArmed = true;
+    const startupRuns = this.routines
+      .filter((routine) => routine.enabled && routine.schedule.type === "startup")
+      .map((routine) => this.newRun(routine, this.now(), false, "startup"));
+    if (startupRuns.length === 0) return;
+    this.save();
+    for (const run of startupRuns) this.emitRun(run);
   }
 
   listRoutines(): Routine[] {
@@ -604,6 +648,7 @@ export class RoutineManager {
 
   start() {
     if (this.timer) return;
+    this.armStartup();
     void this.tick();
     this.timer = setInterval(() => void this.tick(), 10_000);
     this.timer.unref?.();
@@ -636,8 +681,7 @@ export class RoutineManager {
           const run = this.newRun(routine, scheduledFor, false);
           this.emitRun(run);
         }
-        routine.nextRunAt =
-          routine.schedule.type === "once" ? null : nextOccurrence(routine.schedule, Math.max(now, scheduledFor));
+        routine.nextRunAt = nextOccurrence(routine.schedule, Math.max(now, scheduledFor));
         if (routine.schedule.type === "once") routine.enabled = false;
         routine.updatedAt = Math.max(now, routine.updatedAt + 1);
         this.emitRoutine(routine);
@@ -756,7 +800,12 @@ export class RoutineManager {
     return nextOccurrence(schedule, now);
   }
 
-  private newRun(routine: Routine, scheduledFor: number, manual: boolean): RoutineRun {
+  private newRun(
+    routine: Routine,
+    scheduledFor: number,
+    manual: boolean,
+    triggerSource: RoutineRunTrigger = manual ? "manual" : "schedule",
+  ): RoutineRun {
     const run: RoutineRun = {
       id: randomUUID(),
       routineId: routine.id,
@@ -768,7 +817,7 @@ export class RoutineManager {
       scheduledFor,
       status: "queued",
       manual,
-      triggerSource: manual ? "manual" : "schedule",
+      triggerSource,
       sourceThreadId: routine.sourceThreadId,
       createdAt: this.now(),
     };

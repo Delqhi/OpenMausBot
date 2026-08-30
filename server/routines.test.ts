@@ -80,9 +80,197 @@ describe("nextOccurrence", () => {
     expect(nextOccurrence({ type: "once", at: 200 }, 100)).toBe(200);
     expect(nextOccurrence({ type: "once", at: 100 }, 100)).toBeNull();
   });
+
+  it("does not invent a wall-clock occurrence for an app-start schedule", () => {
+    expect(nextOccurrence({ type: "startup" }, Date.now())).toBeNull();
+  });
 });
 
 describe("RoutineManager", () => {
+  it("arms a newly created app-start routine only after a successful launch hook", async () => {
+    const h = harness();
+    const routine = h.manager.create({
+      name: "Launch brief",
+      prompt: "Summarize what needs attention",
+      botId: "maus-startup",
+      schedule: { type: "startup" },
+    });
+
+    expect(routine).toMatchObject({
+      enabled: true,
+      schedule: { type: "startup" },
+      nextRunAt: null,
+    });
+    await h.manager.tick();
+    expect(h.manager.listRuns()).toEqual([]);
+    expect(h.started).toEqual([]);
+
+    const launched = new RoutineManager(h.options);
+    // Constructing a candidate server process is not itself a successful app
+    // launch; packaged Electron may discard it while trying another port.
+    expect(launched.listRuns()).toEqual([]);
+    launched.armStartup();
+    launched.armStartup();
+    expect(launched.listRuns()).toMatchObject([{
+      routineId: routine.id,
+      status: "queued",
+      triggerSource: "startup",
+    }]);
+    await launched.tick();
+    await launched.tick();
+
+    expect(h.started).toEqual([{
+      botId: "maus-startup",
+      threadId: "thread-1",
+      prompt: "Summarize what needs attention",
+    }]);
+    expect(h.triggerSources).toEqual(["startup"]);
+    expect(launched.listRuns()).toHaveLength(1);
+    expect(launched.listRoutines()[0]).toMatchObject({ enabled: true, nextRunAt: null });
+  });
+
+  it("does not re-arm app-start routines when the same manager stops and starts again", () => {
+    const h = harness();
+    h.manager.create({
+      name: "One process launch",
+      prompt: "Run once for this process",
+      botId: "maus-one-process",
+      schedule: { type: "startup" },
+    });
+    h.setBot("busy");
+    const launched = new RoutineManager(h.options);
+
+    launched.start();
+    launched.stop();
+    launched.start();
+    launched.stop();
+
+    expect(launched.listRuns().filter((run) => run.status === "queued")).toHaveLength(1);
+  });
+
+  it("queues an enabled app-start routine again on the following restart", async () => {
+    const h = harness();
+    const routine = h.manager.create({
+      name: "Each launch",
+      prompt: "Check the launch state",
+      botId: "maus-repeat",
+      schedule: { type: "startup" },
+    });
+    const firstLaunch = new RoutineManager(h.options);
+    firstLaunch.armStartup();
+    await firstLaunch.tick();
+    firstLaunch.handleRuntimeEvent({
+      eventId: "first-launch-complete",
+      provider: "fake",
+      threadId: "thread-1",
+      createdAt: new Date().toISOString(),
+      type: "turn.completed",
+      ok: true,
+    });
+
+    const secondLaunch = new RoutineManager(h.options);
+    secondLaunch.armStartup();
+    expect(secondLaunch.listRuns().filter((run) => run.routineId === routine.id)).toHaveLength(2);
+    expect(secondLaunch.listRuns().filter((run) => run.status === "queued")).toHaveLength(1);
+    await secondLaunch.tick();
+
+    expect(h.started.map(({ threadId }) => threadId)).toEqual(["thread-1", "thread-2"]);
+    expect(h.triggerSources).toEqual(["startup", "startup"]);
+    expect(secondLaunch.listRoutines()[0]).toMatchObject({ enabled: true, nextRunAt: null });
+  });
+
+  it("replaces an undelivered startup trigger instead of stacking it after restart", async () => {
+    const h = harness();
+    const routine = h.manager.create({
+      name: "Launch once",
+      prompt: "Do not duplicate this launch task",
+      botId: "maus-launch-once",
+      schedule: { type: "startup" },
+    });
+    const firstLaunch = new RoutineManager(h.options);
+    firstLaunch.armStartup();
+    const firstRun = firstLaunch.listRuns().find((run) => run.routineId === routine.id)!;
+    expect(firstRun.status).toBe("queued");
+
+    const secondLaunch = new RoutineManager(h.options);
+    expect(secondLaunch.listRuns().filter((run) => run.status === "queued")).toHaveLength(0);
+    secondLaunch.armStartup();
+    const launchRuns = secondLaunch.listRuns().filter((run) => run.routineId === routine.id);
+    expect(launchRuns).toHaveLength(2);
+    expect(launchRuns.find((run) => run.id === firstRun.id)).toMatchObject({
+      status: "cancelled",
+      error: "OpenMausBot restarted before this app-start routine began",
+    });
+    expect(launchRuns.filter((run) => run.status === "queued")).toHaveLength(1);
+    expect(h.failed).toEqual([]);
+
+    await secondLaunch.tick();
+    expect(h.started).toEqual([{
+      botId: "maus-launch-once",
+      threadId: "thread-1",
+      prompt: "Do not duplicate this launch task",
+    }]);
+    expect(secondLaunch.listRuns().filter((run) => run.status === "queued")).toHaveLength(0);
+  });
+
+  it("does not run a paused or newly resumed app-start routine until a later launch", async () => {
+    const h = harness();
+    const routine = h.manager.create({
+      name: "Paused launch",
+      prompt: "Wait for a future launch",
+      botId: "maus-paused-startup",
+      enabled: false,
+      schedule: { type: "startup" },
+    });
+    const launchedPaused = new RoutineManager(h.options);
+    launchedPaused.armStartup();
+    await launchedPaused.tick();
+    expect(launchedPaused.listRuns()).toEqual([]);
+
+    launchedPaused.update(routine.id, { enabled: true });
+    await launchedPaused.tick();
+    expect(launchedPaused.listRuns()).toEqual([]);
+
+    const launchedResumed = new RoutineManager(h.options);
+    launchedResumed.armStartup();
+    expect(launchedResumed.listRuns()).toMatchObject([{
+      routineId: routine.id,
+      status: "queued",
+      triggerSource: "startup",
+    }]);
+  });
+
+  it("arms an existing routine edited to app-start without running it immediately", async () => {
+    const h = harness();
+    const routine = h.manager.create({
+      name: "Change cadence",
+      prompt: "Run after the app starts",
+      botId: "maus-edited-startup",
+      schedule: { type: "daily", time: "09:00", weekdays: [1] },
+    });
+    const edited = h.manager.update(routine.id, { schedule: { type: "startup" } });
+    expect(edited).toMatchObject({ schedule: { type: "startup" }, nextRunAt: null });
+    await h.manager.tick();
+    expect(h.manager.listRuns()).toEqual([]);
+
+    const relaunched = new RoutineManager(h.options);
+    relaunched.armStartup();
+    expect(relaunched.listRuns()).toMatchObject([{ routineId: routine.id, triggerSource: "startup" }]);
+  });
+
+  it("validates app-start schedule input without weakening unknown-type rejection", () => {
+    const h = harness();
+    // SAFETY: this deliberately malformed schedule exercises the runtime
+    // boundary that receives untyped HTTP payloads in production.
+    expect(() => h.manager.create({
+      name: "Invalid launch",
+      prompt: "Never run",
+      botId: "maus-invalid-startup",
+      schedule: { type: "on_start" } as never,
+    })).toThrow("Choose a supported schedule");
+    expect(h.manager.listRoutines()).toEqual([]);
+  });
+
   it("persists definitions separately from permanent run receipts", async () => {
     const h = harness();
     const routine = h.manager.create({

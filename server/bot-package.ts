@@ -98,6 +98,7 @@ const packageSchema = z.object({
           time: requiredText(5).regex(/^([01]\d|2[0-3]):[0-5]\d$/, { message: "must use HH:MM" }),
           weekdays: z.array(z.number().int().min(0).max(6)).min(1).max(7),
         }),
+        z.object({ type: z.literal("startup") }),
       ]),
       durationMinutes: z.number().int().min(15).max(240),
       enabledAfterInstall: z.literal(false),
@@ -223,7 +224,13 @@ export function renderBotPackageMarkdown(document: ParsedBotPackage): string {
   const routines = (pkg.routines ?? []).map((routine) => [
     `### ${routine.name}`,
     `**Owner:** \`${routine.agent}\`  `,
-    `**Schedule:** ${routine.schedule.type === "daily" ? `${routine.schedule.time} on weekdays ${routine.schedule.weekdays.join(", ")}` : `once at ${routine.schedule.at}`}  `,
+    `**Schedule:** ${
+      routine.schedule.type === "daily"
+        ? `${routine.schedule.time} on weekdays ${routine.schedule.weekdays.join(", ")}`
+        : routine.schedule.type === "startup"
+          ? "on each OpenMausBot app start"
+          : `once at ${routine.schedule.at}`
+    }  `,
     "**Initial state:** paused — the user must enable it",
     "",
     routine.prompt,

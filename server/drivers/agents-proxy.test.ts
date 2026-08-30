@@ -227,7 +227,7 @@ describe("agents-proxy MCP surface", () => {
     expect(JSON.stringify(create.inputSchema)).not.toMatch(/"oneOf"|"anyOf"|"allOf"|"const"/);
     expect(schedule.type).toBe("object");
     expect(schedule.required).toEqual(["type"]);
-    expect(schedule.properties.type.enum).toEqual(["once", "weekly", "daily"]);
+    expect(schedule.properties.type.enum).toEqual(["once", "weekly", "daily", "startup"]);
     expect(schedule.properties.weekdays.items.enum).toEqual([
       "monday",
       "tuesday",
@@ -471,6 +471,15 @@ describe("agents-proxy MCP surface", () => {
       type: "once",
       at: "2026-09-01T09:00:00+05:30",
     });
+  });
+
+  it("proposes an app-start routine without calendar fields", async () => {
+    await callTool("propose_routine", {
+      name: "Launch check",
+      instructions: "Review anything that needs attention after launch.",
+      schedule: { type: "startup" },
+    });
+    expect(lastRoutineRequestBody.routine.schedule).toEqual({ type: "startup" });
   });
 
   it("proposes routine updates and destructive actions without applying them", async () => {

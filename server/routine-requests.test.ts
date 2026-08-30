@@ -144,7 +144,9 @@ describe("RoutineRequestService", () => {
           durationMinutes: routine.durationMinutes,
           schedule: routine.schedule.type === "once"
             ? { at: routine.schedule.at, type: "once" }
-            : { weekdays: [...routine.schedule.weekdays], time: routine.schedule.time, type: "daily" },
+            : routine.schedule.type === "startup"
+              ? { type: "startup" }
+              : { weekdays: [...routine.schedule.weekdays], time: routine.schedule.time, type: "daily" },
           instructions: routine.instructions,
           runOn: routine.runOn,
           name: routine.name,
@@ -184,6 +186,36 @@ describe("RoutineRequestService", () => {
     expect(card.subtitle).toContain("Name: Full fidelity brief");
     expect(card.subtitle).toContain(`Instructions:\n${instructions}`);
     expect(card.subtitle).toContain("-END");
+  });
+
+  it("normalizes an app-start proposal without inventing a next calendar time", async () => {
+    const { service, store, routines } = harness();
+    const proposed = await service.propose({
+      botId: "bot-a",
+      threadId: "thread-a",
+      proposal: createProposal({ schedule: { type: "startup" } }),
+    });
+
+    expect(proposed.nextRunAt).toBeNull();
+    expect(proposed.summary).toContain("On every OpenMausBot app start");
+    const card = store.messagesFor("thread-a")[0]!.card!;
+    expect(card.routineRequest?.operation).toMatchObject({
+      action: "create",
+      routine: { schedule: { type: "startup" } },
+    });
+    expect(service.resolve({
+      botId: "bot-a",
+      threadId: "thread-a",
+      requestId: proposed.requestId,
+      behavior: "allow",
+    })).toMatchObject({ claimed: true, state: "applied", action: "create" });
+    expect(routines.listRoutines()).toMatchObject([{
+      schedule: { type: "startup" },
+      enabled: true,
+      nextRunAt: null,
+    }]);
+    await routines.tick();
+    expect(routines.listRuns()).toEqual([]);
   });
 
   it("never returns an existing routine's credential-shaped text to the proposing bot", async () => {

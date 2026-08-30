@@ -55,6 +55,7 @@ const routineToolScheduleSchema = z.discriminatedUnion("type", [
     time: z.string().max(5),
     weekdays: z.array(z.string().max(9)).min(1).max(7),
   }).strict(),
+  z.object({ type: z.literal("startup") }).strict(),
 ]);
 
 const routineToolDefinitionSchema = z.object({
@@ -96,6 +97,7 @@ const storedScheduleSchema = z.discriminatedUnion("type", [
     time: z.string().regex(TIME),
     weekdays: storedWeekdaysSchema,
   }).strict(),
+  z.object({ type: z.literal("startup") }).strict(),
 ]);
 const storedDefinitionSchema = z.object({
   name: z.string().trim().min(1).max(80),
@@ -271,6 +273,7 @@ function duration(value: number | undefined): number {
 }
 
 function normalizeSchedule(schedule: RoutineToolScheduleInput, now: number): RoutineRequestSchedule {
+  if (schedule.type === "startup") return { type: "startup" };
   if (schedule.type === "once") {
     const parts = RFC3339_WITH_OFFSET.exec(schedule.at);
     if (!parts) {
@@ -371,7 +374,11 @@ function normalizedOperation(
       changes: normalizeChanges(validated.changes, now),
     };
   }
-  if (validated.action === "resume" && nextOccurrence(current.schedule, now) === null) {
+  if (
+    validated.action === "resume" &&
+    current.schedule.type === "once" &&
+    nextOccurrence(current.schedule, now) === null
+  ) {
     throw new RoutineRequestError(
       "That one-time routine's scheduled time has passed. Update it to a new future time before resuming.",
       409,
@@ -381,9 +388,9 @@ function normalizedOperation(
 }
 
 function asSchedule(schedule: RoutineRequestSchedule): RoutineSchedule {
-  return schedule.type === "once"
-    ? { type: "once", at: schedule.at }
-    : { type: "daily", time: schedule.time, weekdays: [...schedule.weekdays] };
+  if (schedule.type === "once") return { type: "once", at: schedule.at };
+  if (schedule.type === "startup") return { type: "startup" };
+  return { type: "daily", time: schedule.time, weekdays: [...schedule.weekdays] };
 }
 
 function nextForOperation(operation: RoutineRequestOperation, manager: RoutineManager, now: number): number | null {
@@ -412,6 +419,7 @@ function formatInstant(at: number, timeZone: string): string {
 }
 
 function scheduleText(schedule: RoutineRequestSchedule, timeZone: string): string {
+  if (schedule.type === "startup") return "On every OpenMausBot app start";
   if (schedule.type === "once") return `${formatInstant(schedule.at, timeZone)} (${timeZone})`;
   const days = schedule.weekdays.map((day) => WEEKDAY_LABEL[day]).join(", ");
   return `${days} at ${schedule.time} (${timeZone})`;
@@ -460,15 +468,19 @@ function cardCopy(
     ? null
     : manager.listRoutines().find((routine) => routine.id === operation.routineId) ?? null;
   const remainsPaused = operation.action === "update" && current?.enabled === false;
+  const waitsForStartup = definition.schedule.type === "startup" &&
+    operation.action !== "pause" && operation.action !== "delete" && !remainsPaused;
   const nextDescription = nextRunAt !== null
     ? formatInstant(nextRunAt, timeZone)
-    : remainsPaused
-      ? "None — this routine remains paused"
-      : operation.action === "pause"
-        ? "None — this routine will be paused"
-        : operation.action === "delete"
-          ? "None — this routine will be deleted"
-          : "None";
+    : waitsForStartup
+      ? "Next app start"
+      : remainsPaused
+        ? "None — this routine remains paused"
+        : operation.action === "pause"
+          ? "None — this routine will be paused"
+          : operation.action === "delete"
+            ? "None — this routine will be deleted"
+            : "None";
   const status = remainsPaused ? " · Remains paused" : "";
   // Existing routines may predate nested-card redaction. The approval still
   // shows every instruction, but credential-shaped values never travel back
