@@ -204,8 +204,17 @@ import {
 } from "./turn-dispatch-guard.ts";
 import { createGracefulShutdown } from "./graceful-shutdown.ts";
 
-const PORT = Number(process.env.OMB_PORT || process.env.OGB_PORT || 8799);
-const WEBHOOK_PORT = Number(process.env.OMB_WEBHOOK_PORT || PORT + 1);
+const REQUESTED_PORT = Number(process.env.OMB_PORT || process.env.OGB_PORT || 8799);
+const EXPLICIT_WEBHOOK_PORT = process.env.OMB_WEBHOOK_PORT
+  ? Number(process.env.OMB_WEBHOOK_PORT)
+  : null;
+// Consumers must opt in because a standalone Vite proxy or configured MCP
+// client cannot learn an arbitrary replacement port. Packaged Electron owns
+// an authenticated adoption channel and enables this only for its final
+// host-allocated attempt.
+const PORT_FALLBACK_ENABLED = process.env.OMB_PORT_FALLBACK === "1";
+let PORT = REQUESTED_PORT;
+let WEBHOOK_PORT = EXPLICIT_WEBHOOK_PORT ?? PORT + 1;
 const STATIC_DIR = process.env.OMB_STATIC_DIR || null;
 const MIME: Record<string, string> = {
   ".html": "text/html",
@@ -236,11 +245,25 @@ type UtilityParentPort = {
 // SAFETY: Electron's utility-process runtime is the only environment that
 // supplies parentPort; plain Node intentionally leaves it absent.
 const utilityParentPort = (process as NodeJS.Process & { parentPort?: UtilityParentPort }).parentPort;
-type DesktopPrivateMessage = BrowserCleanupWireRequest | {
-  type: "openmausbot:browser-control";
-  botId: string;
-  held: true;
-};
+type DesktopPrivateMessage = BrowserCleanupWireRequest
+  | {
+    type: "openmausbot:browser-control";
+    botId: string;
+    held: true;
+  }
+  | {
+    type: "openmausbot:listen";
+    requestedPort: number;
+    port: number;
+    webhookPort: number | null;
+    pid: number;
+  }
+  | {
+    type: "openmausbot:listen-error";
+    requestedPort: number;
+    code: "EADDRINUSE";
+    pid: number;
+  };
 function postDesktopPrivateMessage(message: DesktopPrivateMessage): boolean {
   if (!utilityParentPort) return false;
   try {
@@ -3037,13 +3060,6 @@ const webhooks = new WebhookManager({
 
 let webhookIngress: WebhookIngress | null = null;
 let webhookIngressError: string | null = null;
-try {
-  webhookIngress = await listenWebhookIngress(webhooks, { port: WEBHOOK_PORT });
-  console.log(`openmausbot webhook receiver on ${webhookIngress.baseUrl}`);
-} catch (error) {
-  webhookIngressError = error instanceof Error ? error.message : String(error);
-  console.error(`openmausbot webhook receiver unavailable: ${webhookIngressError}`);
-}
 
 const webhookIngressStatus = () => ({
   available: Boolean(webhookIngress),
@@ -7746,9 +7762,118 @@ const server = createServer(async (req, res) => {
   }
 });
 
-server.listen(PORT, "127.0.0.1", () => {
-  console.log(`openmausbot server on http://127.0.0.1:${PORT}`);
-});
+const SERVER_HOST = "127.0.0.1";
+const DISCOVERABLE_PORTS = [8799, 18799, 28799] as const;
+const HOST_ALLOCATED_PAIR_ATTEMPTS = 8;
+
+function addressInUse(error: unknown): boolean {
+  return typeof error === "object"
+    && error !== null
+    && (error as NodeJS.ErrnoException).code === "EADDRINUSE";
+}
+
+function startupPortCandidates(requestedPort: number): number[] {
+  // Port zero is already the OS-allocation request. Retry it only when the
+  // adjacent derived webhook port happens to lose the small bind race.
+  if (requestedPort === 0) return Array(HOST_ALLOCATED_PAIR_ATTEMPTS).fill(0);
+  if (!PORT_FALLBACK_ENABLED) return [requestedPort];
+
+  // Keep the long-standing public ports first so MCP clients can still find a
+  // standalone server without a second discovery channel. An arbitrary
+  // configured port gets one exact attempt before the OS chooses a free one.
+  const discoverableIndex = DISCOVERABLE_PORTS.indexOf(requestedPort as typeof DISCOVERABLE_PORTS[number]);
+  const fixed = discoverableIndex >= 0
+    ? DISCOVERABLE_PORTS.slice(discoverableIndex)
+    : [requestedPort];
+  return [...fixed, ...Array(HOST_ALLOCATED_PAIR_ATTEMPTS).fill(0)];
+}
+
+function listenMainServer(port: number): Promise<number> {
+  return new Promise<number>((resolve, reject) => {
+    const onError = (error: Error) => {
+      server.off("error", onError);
+      reject(error);
+    };
+    server.once("error", onError);
+    server.listen(port, SERVER_HOST, () => {
+      server.off("error", onError);
+      const address = server.address();
+      if (!address || typeof address === "string") {
+        reject(new Error("OpenMausBot server did not get a TCP address"));
+        return;
+      }
+      resolve(address.port);
+    });
+  });
+}
+
+function closeMainServer(): Promise<void> {
+  if (!server.listening) return Promise.resolve();
+  return new Promise<void>((resolve, reject) => {
+    server.close((error) => error ? reject(error) : resolve());
+  });
+}
+
+async function startListeners(): Promise<void> {
+  let lastConflict: unknown = null;
+  for (const candidate of startupPortCandidates(REQUESTED_PORT)) {
+    let resolvedPort: number;
+    try {
+      resolvedPort = await listenMainServer(candidate);
+    } catch (error) {
+      if (!addressInUse(error)) throw error;
+      lastConflict = error;
+      continue;
+    }
+
+    PORT = resolvedPort;
+    WEBHOOK_PORT = EXPLICIT_WEBHOOK_PORT ?? resolvedPort + 1;
+    webhookIngress = null;
+    webhookIngressError = null;
+    try {
+      webhookIngress = await listenWebhookIngress(webhooks, { port: WEBHOOK_PORT, host: SERVER_HOST });
+      WEBHOOK_PORT = webhookIngress.port;
+      console.log(`openmausbot webhook receiver on ${webhookIngress.baseUrl}`);
+    } catch (error) {
+      // A derived neighbor belongs to the same startup pair. If it is busy,
+      // release the main listener too and choose the next whole pair. An
+      // explicitly configured webhook port keeps its historical behavior:
+      // the main app stays available and the webhook status reports the error.
+      if (
+        EXPLICIT_WEBHOOK_PORT === null &&
+        (PORT_FALLBACK_ENABLED || Boolean(utilityParentPort)) &&
+        addressInUse(error)
+      ) {
+        lastConflict = error;
+        await closeMainServer();
+        continue;
+      }
+      webhookIngressError = error instanceof Error ? error.message : String(error);
+      console.error(`openmausbot webhook receiver unavailable: ${webhookIngressError}`);
+    }
+
+    console.log(`openmausbot server on http://${SERVER_HOST}:${PORT}`);
+    postDesktopPrivateMessage({
+      type: "openmausbot:listen",
+      requestedPort: REQUESTED_PORT,
+      port: PORT,
+      webhookPort: webhookIngress?.port ?? null,
+      pid: process.pid,
+    });
+    return;
+  }
+  if (addressInUse(lastConflict)) {
+    postDesktopPrivateMessage({
+      type: "openmausbot:listen-error",
+      requestedPort: REQUESTED_PORT,
+      code: "EADDRINUSE",
+      pid: process.pid,
+    });
+  }
+  throw lastConflict ?? new Error(`OpenMausBot could not bind port ${REQUESTED_PORT}`);
+}
+
+await startListeners();
 
 const gracefulShutdown = createGracefulShutdown({
   cleanup: [

@@ -20,7 +20,11 @@ import { startUpdater, registerUpdaterIpc } from "./updater.mjs";
 import { buildDiagnosticsReport, decodeLogTail, diagnosticsFileName } from "./diagnostics.mjs";
 import { migrateWorkspaceCredentials, workspaceCredentialEnv } from "./workspace-credentials.mjs";
 import { activateExistingWindow } from "./single-instance.mjs";
-import { pollServerIdentity } from "./server-boot-probe.mjs";
+import {
+  parseServerListenAnnouncement,
+  parseServerListenConflict,
+  pollServerIdentity,
+} from "./server-boot-probe.mjs";
 import { packageUrlFromCommandLine, packageUrlFromDeepLink } from "./package-link.mjs";
 import { windowChromeOptions } from "./window-chrome.mjs";
 import { defaultSaveName, withSavableFile } from "./save-file.mjs";
@@ -779,6 +783,7 @@ function receiveBrowserLifecycleCleanup(proc, rawMessage) {
 }
 
 async function startServerOn(port) {
+  const bootStartedAt = Date.now();
   const entry = path.join(process.resourcesPath, "server", "index.js");
   const childEnv = managedComposioChildEnvironment(composioBrokerUrl(), secureCredentials, {
     ...process.env,
@@ -790,6 +795,10 @@ async function startServerOn(port) {
     OMB_RESOURCES_PATH: process.resourcesPath,
     OMB_SKILLS_DIR: path.join(process.resourcesPath, "skills"),
     OMB_PORT: String(port),
+    // The desktop parent preserves its established fixed-port retries itself.
+    // Only its final port=0 attempt lets the child retry whole OS-assigned
+    // main+webhook pairs before adoption through the private handshake.
+    OMB_PORT_FALLBACK: port === 0 ? "1" : "0",
     OMB_USER_DATA: app.getPath("userData"),
     ...(secureCredentials.composioApiKey
       ? { COMPOSIO_API_KEY: secureCredentials.composioApiKey }
@@ -802,6 +811,10 @@ async function startServerOn(port) {
     ...workspaceCredentialEnv(secureCredentials),
   });
   delete childEnv.OMB_BROWSER_CONNECTION;
+  const inheritedWebhookPort = Number(childEnv.OMB_WEBHOOK_PORT);
+  const expectedWebhookPort = Number.isInteger(inheritedWebhookPort) && inheritedWebhookPort >= 1 && inheritedWebhookPort <= 65_535
+    ? inheritedWebhookPort
+    : null;
   slog(`fork ${entry} port=${port}`);
   const proc = utilityProcess.fork(entry, [], {
     env: childEnv,
@@ -809,8 +822,42 @@ async function startServerOn(port) {
   });
   proc.stdout?.on("data", (d) => slog(`[out] ${String(d).trimEnd()}`));
   proc.stderr?.on("data", (d) => slog(`[err] ${String(d).trimEnd()}`));
+  let settleStartupSignal;
+  let startupSignalSettled = false;
+  const startupSignal = new Promise((resolve) => {
+    settleStartupSignal = (value) => {
+      if (startupSignalSettled) return;
+      startupSignalSettled = true;
+      resolve(value);
+    };
+  });
+  let settleSpawn;
+  let spawnSettled = false;
+  const spawned = new Promise((resolve) => {
+    settleSpawn = () => {
+      if (spawnSettled) return;
+      spawnSettled = true;
+      resolve();
+    };
+  });
   proc.on("message", (message) => {
     try {
+      const announcement = parseServerListenAnnouncement(message, {
+        requestedPort: port,
+        childPid: proc.pid,
+        expectedWebhookPort,
+      });
+      const conflict = parseServerListenConflict(message, {
+        requestedPort: port,
+        childPid: proc.pid,
+      });
+      if (announcement) settleStartupSignal({ outcome: "listening", ...announcement });
+      else if (conflict) settleStartupSignal({ outcome: "port-conflict" });
+      else if ((message?.data ?? message)?.type === "openmausbot:listen") {
+        slog(`rejected invalid listen announcement for requested port ${port}`);
+      } else if ((message?.data ?? message)?.type === "openmausbot:listen-error") {
+        slog(`rejected invalid listen conflict for requested port ${port}`);
+      }
       if (receiveBrowserControlHold(message)) return;
       if (receiveBrowserLifecycleCleanup(proc, message)) return;
     } catch (error) {
@@ -820,10 +867,13 @@ async function startServerOn(port) {
   proc.once("spawn", () => {
     slog(`spawned pid=${proc.pid}`);
     syncBrowserConnection(proc);
+    settleSpawn();
   });
   let exited = false;
   proc.once("exit", (code) => {
     exited = true;
+    settleSpawn();
+    settleStartupSignal(null);
     // Capabilities belong to turns in this exact server child. A crash or
     // restart invalidates them before any replacement child receives the
     // browser descriptor.
@@ -841,29 +891,78 @@ async function startServerOn(port) {
   // The probe itself is deadline-bounded (a hung health endpoint cannot wedge
   // us here forever) and reports WHY it gave up, so the error page can tell
   // port conflict apart from slow startup.
-  const identity = await pollServerIdentity({
-    port,
+  // Fixed ports are also probed concurrently. That preserves the old fast
+  // path when a responsive foreign service already owns the port: the parent
+  // can reap this candidate before its provider/model catalog initialization
+  // reaches listen(). Port zero has no address until the child announces it.
+  const earlyIdentity = port > 0
+    ? spawned.then(() => pollServerIdentity({
+        port,
+        pid: () => proc.pid,
+        bootTimeoutMs: Math.max(1, SERVER_BOOT_TIMEOUT_MS - (Date.now() - bootStartedAt)),
+        isExited: () => exited,
+      }))
+    : null;
+  if (earlyIdentity) {
+    void earlyIdentity.then((identity) => {
+      if (identity.outcome === "foreign-owner") {
+        settleStartupSignal({ outcome: "foreign-owner" });
+      }
+    }).catch(() => {});
+  }
+  const remainingForAnnouncement = Math.max(1, SERVER_BOOT_TIMEOUT_MS - (Date.now() - bootStartedAt));
+  const timeout = setTimeout(() => settleStartupSignal(null), remainingForAnnouncement);
+  timeout.unref?.();
+  const signal = await startupSignal;
+  clearTimeout(timeout);
+  if (signal?.outcome === "port-conflict" || signal?.outcome === "foreign-owner") {
+    slog(`requested port ${port} is already bound`);
+    try {
+      proc.kill();
+    } catch {}
+    return { proc: null, reason: "foreign-owner" };
+  }
+  if (!signal) {
+    slog(
+      exited
+        ? `server child for requested port ${port} exited before reporting its listener`
+        : `server child for requested port ${port} did not report its listener before the boot deadline`,
+    );
+    try {
+      proc.kill();
+    } catch {}
+    return { proc: null, reason: exited ? "exited" : "timeout" };
+  }
+  const resolvedPort = signal.port;
+  const resolvedWebhookPort = signal.webhookPort;
+  if (resolvedPort !== port) {
+    slog(`child adopted host-allocated port=${resolvedPort} webhook=${resolvedWebhookPort ?? "unavailable"}`);
+  }
+  const remainingForIdentity = Math.max(1, SERVER_BOOT_TIMEOUT_MS - (Date.now() - bootStartedAt));
+  const identity = earlyIdentity ?? await pollServerIdentity({
+    port: resolvedPort,
     // Getter, not value: proc.pid stays undefined until the async `spawn`
     // event fires, and capturing it here would make the probe judge our own
     // child a "foreign owner" on its first health answer.
     pid: () => proc.pid,
-    bootTimeoutMs: SERVER_BOOT_TIMEOUT_MS,
+    bootTimeoutMs: remainingForIdentity,
     isExited: () => exited,
   });
-  if (identity.outcome === "ready") return { proc };
-  if (identity.outcome === "exited") {
-    slog(`child on port ${port} exited before answering /api/health`);
+  const resolvedIdentity = await identity;
+  if (resolvedIdentity.outcome === "ready") return { proc, port: resolvedPort, webhookPort: resolvedWebhookPort };
+  if (resolvedIdentity.outcome === "exited") {
+    slog(`child on port ${resolvedPort} exited before answering /api/health`);
   } else {
     slog(
-      identity.outcome === "foreign-owner"
-        ? `port ${port} answered health checks from another process`
-        : `child on port ${port} did not answer /api/health within ${SERVER_BOOT_TIMEOUT_MS / 1000}s`,
+      resolvedIdentity.outcome === "foreign-owner"
+        ? `port ${resolvedPort} answered health checks from another process`
+        : `child on port ${resolvedPort} did not answer /api/health within ${remainingForIdentity / 1000}s`,
     );
   }
   try {
     proc.kill();
   } catch {}
-  return { proc: null, reason: identity.outcome };
+  return { proc: null, reason: resolvedIdentity.outcome };
 }
 
 async function startServerPackaged() {
@@ -875,7 +974,7 @@ async function startServerPackaged() {
       const started = await startServerOn(port);
       if (started.proc) {
         serverProc = started.proc;
-        SERVER_PORT = port;
+        SERVER_PORT = started.port;
         return true;
       }
       // A child that exited or timed out is not evidence of a port conflict —
@@ -883,6 +982,19 @@ async function startServerPackaged() {
       if (started.reason !== "foreign-owner") everyPortForeignOwned = false;
     }
     await new Promise((r) => setTimeout(r, 2500));
+  }
+  // Preserve the fixed ports above for normal starts, stale-relaunch races,
+  // and CLI discovery. Only a proven all-ports-owned conflict reaches this
+  // OS-assigned escape hatch; the child reports the chosen port over its
+  // private IPC channel and the normal pid/static health proof still gates it.
+  if (everyPortForeignOwned) {
+    const started = await startServerOn(0);
+    if (started.proc) {
+      serverProc = started.proc;
+      SERVER_PORT = started.port;
+      return true;
+    }
+    everyPortForeignOwned = started.reason === "foreign-owner";
   }
   serverStartConflictOnly = everyPortForeignOwned;
   return false;

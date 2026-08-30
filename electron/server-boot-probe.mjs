@@ -22,6 +22,63 @@
 
 export const BOOT_PROBE_INTERVAL_MS = 500;
 
+const validTcpPort = (value) => Number.isInteger(value) && value >= 1 && value <= 65_535;
+
+/**
+ * Validate the private listen announcement emitted by the exact utility
+ * process Electron just forked. The IPC channel establishes provenance; the
+ * fields below bind the announcement to this launch and keep a malformed (or
+ * stale) message from redirecting the renderer to an unrelated loopback
+ * service. The health probe still performs the authoritative pid/static
+ * identity check after this parser selects the port.
+ *
+ * @param {unknown} rawMessage
+ * @param {{ requestedPort: number, childPid: number | undefined, expectedWebhookPort?: number | null }} expected
+ * @returns {{ port: number, webhookPort: number | null } | null}
+ */
+export function parseServerListenAnnouncement(
+  rawMessage,
+  { requestedPort, childPid, expectedWebhookPort = null },
+) {
+  const message = rawMessage?.data ?? rawMessage;
+  if (!message || typeof message !== "object" || message.type !== "openmausbot:listen") return null;
+  if (!Number.isInteger(requestedPort) || requestedPort < 0 || requestedPort > 65_535) return null;
+  if (!Number.isInteger(childPid) || childPid <= 0 || message.pid !== childPid) return null;
+  if (message.requestedPort !== requestedPort || !validTcpPort(message.port)) return null;
+  // Packaged fixed-port attempts deliberately disable child fallback so the
+  // established 8799 -> 18799 -> 28799 relaunch behavior remains intact. A
+  // requested port of zero is the final host-allocated escape hatch.
+  if (requestedPort !== 0 && message.port !== requestedPort) return null;
+
+  if (message.webhookPort !== null) {
+    if (!validTcpPort(message.webhookPort)) return null;
+    if (expectedWebhookPort !== null) {
+      if (!validTcpPort(expectedWebhookPort) || message.webhookPort !== expectedWebhookPort) return null;
+    } else if (message.webhookPort !== message.port + 1) {
+      return null;
+    }
+  }
+  return { port: message.port, webhookPort: message.webhookPort };
+}
+
+/** Validate a bind-conflict report from the same freshly forked child. */
+export function parseServerListenConflict(rawMessage, { requestedPort, childPid }) {
+  const message = rawMessage?.data ?? rawMessage;
+  return Boolean(
+    message
+    && typeof message === "object"
+    && message.type === "openmausbot:listen-error"
+    && message.code === "EADDRINUSE"
+    && Number.isInteger(requestedPort)
+    && requestedPort >= 1
+    && requestedPort <= 65_535
+    && Number.isInteger(childPid)
+    && childPid > 0
+    && message.pid === childPid
+    && message.requestedPort === requestedPort,
+  );
+}
+
 const defaultSleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 /**

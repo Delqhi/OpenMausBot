@@ -1,7 +1,11 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { pollServerIdentity } from "./server-boot-probe.mjs";
+import {
+  parseServerListenAnnouncement,
+  parseServerListenConflict,
+  pollServerIdentity,
+} from "./server-boot-probe.mjs";
 
 const OUR_BODY = () => ({ app: "openmausbot", pid: 4242, static: true });
 
@@ -12,6 +16,88 @@ function okFetch({ body = OUR_BODY(), status = 200 } = {}) {
     json: async () => body,
   });
 }
+
+test("adopts an OS-assigned child port only after the launch fields validate", async () => {
+  const announcement = parseServerListenAnnouncement({
+    type: "openmausbot:listen",
+    requestedPort: 0,
+    port: 43_211,
+    webhookPort: 43_212,
+    pid: 4242,
+  }, { requestedPort: 0, childPid: 4242 });
+  assert.deepEqual(announcement, { port: 43_211, webhookPort: 43_212 });
+
+  let probedUrl = "";
+  const identity = await pollServerIdentity({
+    port: announcement.port,
+    pid: () => 4242,
+    bootTimeoutMs: 5_000,
+    fetchImpl: async (url) => {
+      probedUrl = String(url);
+      return { ok: true, status: 200, json: async () => OUR_BODY() };
+    },
+  });
+  assert.equal(probedUrl, "http://127.0.0.1:43211/api/health");
+  assert.equal(identity.outcome, "ready");
+});
+
+test("rejects stale, redirected, or malformed listen announcements", () => {
+  const valid = {
+    type: "openmausbot:listen",
+    requestedPort: 0,
+    port: 43_211,
+    webhookPort: 43_212,
+    pid: 4242,
+  };
+  const parse = (message, requestedPort = 0) => parseServerListenAnnouncement(
+    message,
+    { requestedPort, childPid: 4242 },
+  );
+
+  assert.equal(parse({ ...valid, pid: 1111 }), null);
+  assert.equal(parse({ ...valid, requestedPort: 8799 }), null);
+  assert.equal(parse({ ...valid, port: 0 }), null);
+  assert.equal(parse({ ...valid, port: 65_536 }), null);
+  assert.equal(parse({ ...valid, webhookPort: 43_299 }), null);
+  assert.equal(parse({ ...valid, port: 18_799, webhookPort: 18_800 }, 8799), null);
+  assert.deepEqual(parse({
+    ...valid,
+    requestedPort: 8799,
+    port: 8799,
+    webhookPort: null,
+  }, 8799), { port: 8799, webhookPort: null });
+});
+
+test("accepts only the configured explicit webhook listener when one is inherited", () => {
+  const message = {
+    type: "openmausbot:listen",
+    requestedPort: 8799,
+    port: 8799,
+    webhookPort: 39_001,
+    pid: 4242,
+  };
+  const expected = { requestedPort: 8799, childPid: 4242, expectedWebhookPort: 39_001 };
+  assert.deepEqual(parseServerListenAnnouncement(message, expected), {
+    port: 8799,
+    webhookPort: 39_001,
+  });
+  assert.equal(parseServerListenAnnouncement({ ...message, webhookPort: 39_002 }, expected), null);
+});
+
+test("accepts only a bind conflict reported by the exact fixed-port child", () => {
+  const valid = {
+    type: "openmausbot:listen-error",
+    requestedPort: 8799,
+    code: "EADDRINUSE",
+    pid: 4242,
+  };
+  const expected = { requestedPort: 8799, childPid: 4242 };
+  assert.equal(parseServerListenConflict(valid, expected), true);
+  assert.equal(parseServerListenConflict({ ...valid, pid: 9999 }, expected), false);
+  assert.equal(parseServerListenConflict({ ...valid, requestedPort: 18799 }, expected), false);
+  assert.equal(parseServerListenConflict({ ...valid, code: "EACCES" }, expected), false);
+  assert.equal(parseServerListenConflict(valid, { requestedPort: 0, childPid: 4242 }), false);
+});
 
 test("returns ready when our own child answers with its identity", async () => {
   const outcome = await pollServerIdentity({
