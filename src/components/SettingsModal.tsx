@@ -3,7 +3,7 @@
 // is the stuff shared by every bot: who you are, your keys, and the
 // machine your bots can borrow.
 import { useEffect, useRef, useState } from "react";
-import { Coins, FlaskConical, Globe, KeyRound, Monitor, Search, Smartphone, Terminal, Trash2, User, X } from "lucide-react";
+import { Coins, ExternalLink, FlaskConical, Globe, KeyRound, Monitor, Search, Smartphone, Terminal, Trash2, User, X } from "lucide-react";
 import { api, useStore, type AppSettingsSection, type ConfigStatus } from "@/state/store";
 import { analyticsEnabled, setAnalyticsEnabled } from "@/lib/analytics";
 import { builtInBrowserEnabled, showToolCallsEnabled, skillRecorderEnabled } from "@/lib/feature-flags";
@@ -29,7 +29,7 @@ const SECTIONS: Array<{
   icon: typeof User;
   keywords: string[];
 }> = [
-  { id: "general", label: "General", icon: User, keywords: ["profile", "name", "email", "skin", "theme", "appearance", "analytics", "updates", "tools", "tool calls"] },
+  { id: "general", label: "General", icon: User, keywords: ["profile", "name", "email", "skin", "theme", "appearance", "analytics", "updates", "tools", "tool calls", "feedback", "support", "contact", "github", "bug", "issue"] },
   { id: "experimental", label: "Experimental", icon: FlaskConical, keywords: ["early", "preview", "teach", "skill", "browser", "profiles"] },
   { id: "connections", label: "Connections", icon: KeyRound, keywords: ["keys", "api", "composio", "box", "xai", "vps"] },
   { id: "engines", label: "Engines", icon: Terminal, keywords: ["models", "claude", "grok", "providers", "cli"] },
@@ -482,6 +482,33 @@ function DiagnosticsRow() {
   );
 }
 
+const FEEDBACK_URL = "https://github.com/milind-soni/OpenMausBot/issues/new/choose";
+
+function FeedbackRow() {
+  const openFeedback = async () => {
+    if (window.ogb?.openExternal) {
+      await window.ogb.openExternal(FEEDBACK_URL);
+      return;
+    }
+    window.open(FEEDBACK_URL, "_blank", "noopener,noreferrer");
+  };
+
+  return (
+    <Card
+      title="Feedback & support"
+      subtitle="Found a bug or have an idea? Share it with the OpenMausBot community on GitHub."
+    >
+      <button
+        onClick={() => void openFeedback()}
+        className="flex items-center gap-1.5 rounded-lg border border-hairline/40 px-3 py-1.5 text-[13px] text-ink hover:bg-control"
+      >
+        Share feedback
+        <ExternalLink size={13} aria-hidden="true" />
+      </button>
+    </Card>
+  );
+}
+
 export function SettingsModal() {
   const { state, dispatch } = useStore();
   const section = state.appSettingsSection;
@@ -624,6 +651,7 @@ export function SettingsModal() {
                 <ToolCallsRow />
                 <UpdatesRow />
                 <DiagnosticsRow />
+                <FeedbackRow />
                 <AnalyticsRow />
               </>
             )}
