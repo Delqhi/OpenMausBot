@@ -512,7 +512,14 @@ async function browserIntegration(
     profile: partitionId,
     integration: {
       command: process.execPath,
-      args: [SPAWNED_PROXIES.browser],
+      // Real-chrome backend: route the bridge at the OpenBot agent-computer
+      // API (real headed Chrome, per-bot profile) instead of the Electron
+      // browser proxy. Opt-in via OPENMAUSBOT_REAL_CHROME=1 on the harness.
+      ...(process.env.OPENMAUSBOT_REAL_CHROME === "1"
+        ? {
+            args: [SPAWNED_PROXIES.browser.replace("browser-proxy", "browser-bridge")],
+          }
+        : { args: [SPAWNED_PROXIES.browser] }),
       env: {
         ...AGENTS_NODE_FLAG,
         OMB_BROWSER_URL: connection.url,
@@ -521,6 +528,17 @@ async function browserIntegration(
         OMB_BOT_ID: botId,
         OMB_CONTROL_URL: control.url,
         OMB_CONTROL_TOKEN: control.token,
+        // Real-chrome backend (docs/openmausbot-real-chrome.md): the same
+        // browser tool surface rides our bridge to the OpenBot agent-computer
+        // API. Only the openai-compat driver consumes these; codex stays on
+        // the native Electron path.
+        ...(process.env.OPENMAUSBOT_REAL_CHROME === "1"
+          ? {
+              OMB_AC_BASE: process.env.OMB_AC_BASE ?? "http://127.0.0.1:4100",
+              OMB_AC_TOKEN: process.env.OMB_AC_TOKEN ?? "",
+              OMB_AC_BOT: botId,
+            }
+          : {}),
       },
     },
   };

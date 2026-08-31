@@ -83,6 +83,104 @@ function decodeConfig(raw: unknown): OpenAICompatConfig {
   };
 }
 
+/** Parse a model-provided tool-call arguments string. An empty string is the
+ * common "no arguments" case, not an error; malformed JSON degrades to an
+ * empty object the tool can reject with its own message. */
+function safeToolArguments(raw: unknown): Record<string, unknown> {
+  if (typeof raw !== "string" || !raw.trim()) return {};
+  try {
+    const parsed = JSON.parse(raw);
+    return typeof parsed === "object" && parsed !== null ? (parsed as Record<string, unknown>) : {};
+  } catch {
+    return {};
+  }
+}
+
+/**
+ * Minimal stdio JSON-RPC 2.0 client for one MCP server (house style:
+ * browser-proxy/agents-proxy speak the same wire format). Lifetime is one
+ * turn: started before the first tools/list, stopped when the turn ends.
+ */
+class StdioMcpClient {
+  private readonly spec: { command: string; args: string[]; env: Record<string, string> };
+  private child: ReturnType<typeof import("node:child_process").spawn> | null = null;
+  private nextId = 1;
+  private pending = new Map<number, { resolve: (value: unknown) => void; reject: (error: Error) => void }>();
+  private buffer = "";
+
+  constructor(spec: { command: string; args: string[]; env: Record<string, string> }) {
+    this.spec = spec;
+  }
+
+  async start(): Promise<void> {
+    const { spawn } = await import("node:child_process");
+    this.child = spawn(this.spec.command, this.spec.args, {
+      env: { ...process.env, ...this.spec.env },
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+    this.child.stdout!.setEncoding("utf8");
+    this.child.stdout!.on("data", (chunk: string) => {
+      this.buffer += chunk;
+      let nl;
+      while ((nl = this.buffer.indexOf("\n")) !== -1) {
+        const line = this.buffer.slice(0, nl).trim();
+        this.buffer = this.buffer.slice(nl + 1);
+        if (!line) continue;
+        try {
+          const message = JSON.parse(line);
+          const pending = this.pending.get(message.id);
+          if (!pending) continue;
+          this.pending.delete(message.id);
+          if (message.error) pending.reject(new Error(message.error.message ?? "MCP error"));
+          else pending.resolve(message.result);
+        } catch {
+          // a malformed line is noise, not a failed request
+        }
+      }
+    });
+    this.child.stderr!.on("data", () => {});
+    await this.request("initialize", {
+      protocolVersion: "2024-11-05",
+      capabilities: {},
+      clientInfo: { name: "openmausbot-openai-compat", version: "1" },
+    });
+    this.send({ jsonrpc: "2.0", method: "notifications/initialized" });
+  }
+
+  private send(message: object): void {
+    this.child?.stdin?.write(`${JSON.stringify(message)}\n`);
+  }
+
+  request(method: string, params: object, timeoutMs = 45_000): Promise<unknown> {
+    const id = this.nextId++;
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        if (this.pending.delete(id)) reject(new Error(`MCP ${method} timed out`));
+      }, timeoutMs);
+      timer.unref?.();
+      this.pending.set(id, {
+        resolve: (value) => {
+          clearTimeout(timer);
+          resolve(value);
+        },
+        reject: (error) => {
+          clearTimeout(timer);
+          reject(error);
+        },
+      });
+      this.send({ jsonrpc: "2.0", id, method, params });
+    });
+  }
+
+  async stop(): Promise<void> {
+    for (const pending of this.pending.values()) pending.reject(new Error("client stopped"));
+    this.pending.clear();
+    this.child?.stdin?.end();
+    this.child?.kill();
+    this.child = null;
+  }
+}
+
 export const OpenAICompatDriver: ProviderDriver<OpenAICompatConfig> = {
   driverKind: DRIVER_KIND,
   metadata: {
@@ -142,17 +240,19 @@ export const OpenAICompatDriver: ProviderDriver<OpenAICompatConfig> = {
     });
 
     const complete = async (
-      messages: Array<{ role: string; content: string }>,
+      messages: Array<Record<string, unknown>>,
       model: string,
       opts: {
         stream: boolean;
         signal?: AbortSignal;
+        tools?: Array<{ type: string; function: { name: string; description?: string; parameters: object } }>;
         onDelta?: (d: string, streamKind?: "assistant_text" | "reasoning_text") => void;
       },
     ): Promise<{
       text: string;
       reasoning: string;
       usage: { input: number; output: number } | null;
+      toolCalls: Array<{ id: string; name: string; arguments: Record<string, unknown>; raw: object }>;
     }> => {
       const res = await fetch(`${config.url}/chat/completions`, {
         method: "POST",
@@ -163,6 +263,7 @@ export const OpenAICompatDriver: ProviderDriver<OpenAICompatConfig> = {
         body: JSON.stringify({
           model,
           messages,
+          ...(opts.tools?.length ? { tools: opts.tools, tool_choice: "auto" } : {}),
           stream: opts.stream,
           // OpenRouter routing: pin the upstream provider when configured —
           // only on OpenRouter itself; strict endpoints reject the field.
@@ -183,6 +284,16 @@ export const OpenAICompatDriver: ProviderDriver<OpenAICompatConfig> = {
         const msg = json.choices?.[0]?.message;
         const mainContent = typeof msg?.content === "string" ? msg.content : "";
         const reasoningContent = typeof msg?.reasoning_content === "string" ? msg.reasoning_content : "";
+        const toolCalls = Array.isArray(msg?.tool_calls)
+          ? msg.tool_calls
+              .filter((call: any) => call?.function?.name)
+              .map((call: any, index: number) => ({
+                id: call.id ?? `call_${index}`,
+                name: call.function.name,
+                arguments: safeToolArguments(call.function.arguments),
+                raw: call,
+              }))
+          : [];
         return {
           text: mainContent,
           reasoning: reasoningContent,
@@ -192,11 +303,13 @@ export const OpenAICompatDriver: ProviderDriver<OpenAICompatConfig> = {
                 output: json.usage.completion_tokens ?? 0,
               }
             : null,
+          toolCalls,
         };
       }
       let text = "";
       let reasoning = "";
       let usage: { input: number; output: number } | null = null;
+      const streamToolCalls: Array<{ id: string; name: string; arguments: string; raw: object | null }> = [];
       const reader = res.body!.getReader();
       const decoder = new TextDecoder();
       let buf = "";
@@ -234,9 +347,33 @@ export const OpenAICompatDriver: ProviderDriver<OpenAICompatConfig> = {
               output: chunk.usage.completion_tokens ?? 0,
             };
           }
+          // Streaming tool calls arrive as indexed deltas on delta.tool_calls.
+          const toolDeltas = Array.isArray(delta?.tool_calls) ? delta.tool_calls : [];
+          for (const toolDelta of toolDeltas) {
+            const index = typeof toolDelta.index === "number" ? toolDelta.index : streamToolCalls.length;
+            while (streamToolCalls.length <= index) {
+              streamToolCalls.push({ id: "", name: "", arguments: "", raw: null });
+            }
+            const pending = streamToolCalls[index];
+            if (toolDelta.id) pending.id = toolDelta.id;
+            if (toolDelta.function?.name) pending.name += toolDelta.function.name;
+            if (typeof toolDelta.function?.arguments === "string") pending.arguments += toolDelta.function.arguments;
+          }
         }
       }
-      return { text, reasoning, usage };
+      const toolCalls = streamToolCalls
+        .filter((call) => call.name)
+        .map((call) => ({
+          id: call.id || `call_${streamToolCalls.indexOf(call)}`,
+          name: call.name,
+          arguments: safeToolArguments(call.arguments),
+          raw: {
+            id: call.id || `call_${streamToolCalls.indexOf(call)}`,
+            type: "function",
+            function: { name: call.name, arguments: call.arguments },
+          },
+        }));
+      return { text, reasoning, usage, toolCalls };
     };
 
     const fetchModels = async (): Promise<void> => {
@@ -293,7 +430,7 @@ export const OpenAICompatDriver: ProviderDriver<OpenAICompatConfig> = {
       const abort = new AbortController();
       active.set(threadId, { abort, turnId });
 
-      const messages = [
+      const messages: Array<Record<string, unknown>> = [
         ...(turn.system ? [{ role: "system", content: turn.system }] : []),
         ...(turn.transcript ?? []).map((m) => ({
           role: m.role === "assistant" ? "assistant" : "user",
@@ -319,27 +456,130 @@ export const OpenAICompatDriver: ProviderDriver<OpenAICompatConfig> = {
 
       (async () => {
         try {
-          const { text, reasoning, usage } = await complete(
-            messages,
-            turn.model || catalog.default,
-            {
-              stream: true,
-              signal: abort.signal,
-              onDelta: (delta, streamKind = "assistant_text") =>
-                emit({
-                  ...base(threadId, turnId),
-                  type: "content.delta",
-                  streamKind,
-                  delta,
-                }),
-            },
-          );
+          /*
+           * Tool loop with native chat-completions tool calling. The browser
+           * (and agents) integration arrives as a generic stdio MCP server;
+           * its tools are listed once per turn and executed on loop until the
+           * model answers without tool calls. This bypasses the codex
+           * namespace representation entirely — glm sees real, fully
+           * schematized function tools.
+           */
+          const mcpServers = [
+            ...(turn.integrations?.browser ? [["browser", turn.integrations.browser] as const] : []),
+            ...(turn.integrations?.agents ? [["agents", turn.integrations.agents] as const] : []),
+            // Host desktop / Local VM / cloud computer arrive as MCP servers
+            // with the same stdio shape — the model addresses them by
+            // namespace (computer__…).
+            ...(turn.integrations?.localComputer
+              ? [["computer", turn.integrations.localComputer] as const]
+              : []),
+          ];
+          const mcpClients = mcpServers.map(([name, spec]) => ({
+            name,
+            client: new StdioMcpClient(spec),
+          }));
+          await Promise.all(mcpClients.map((c) => c.client.start()));
+          const toolsPayload = (
+            await Promise.all(
+              mcpClients.map(async (c) => {
+                try {
+                  const tools = (await c.client.request("tools/list", {})) as {
+                    tools?: Array<{ name: string; description?: string; inputSchema?: object }>;
+                  };
+                  return (tools.tools ?? []).map((tool) => ({
+                    type: "function",
+                    function: {
+                      // Namespaced, collision-free, and unambiguous for the model.
+                      name: `${c.name}__${tool.name}`,
+                      description: tool.description ?? "",
+                      parameters: tool.inputSchema ?? { type: "object", properties: {} },
+                    },
+                  }));
+                } catch {
+                  return [];
+                }
+              }),
+            )
+          ).flat();
+
+          type ChatMessage = Record<string, unknown>;
+          const chat: ChatMessage[] = [...messages];
+          let totalUsage: { input: number; output: number } | null = null;
+          let finalText = "";
+          let finalReasoning = "";
+
+          for (let hop = 0; hop < 12; hop += 1) {
+            const { text, reasoning, usage, toolCalls } = await complete(
+              chat,
+              turn.model || catalog.default,
+              {
+                stream: true,
+                signal: abort.signal,
+                tools: toolsPayload.length ? toolsPayload : undefined,
+                onDelta: (delta, streamKind = "assistant_text") =>
+                  emit({
+                    ...base(threadId, turnId),
+                    type: "content.delta",
+                    streamKind,
+                    delta,
+                  }),
+              },
+            );
+            if (usage) {
+              totalUsage = totalUsage
+                ? {
+                    input: totalUsage.input + usage.input,
+                    output: totalUsage.output + usage.output,
+                  }
+                : usage;
+            }
+            if (!toolCalls.length) {
+              finalText = text;
+              finalReasoning = reasoning;
+              break;
+            }
+            // The assistant's tool-call turn becomes part of the transcript,
+            // then each result is appended as a tool message.
+            chat.push({
+              role: "assistant",
+              content: text || null,
+              ...(toolCalls.length ? { tool_calls: toolCalls.map((call) => call.raw) } : {}),
+            });
+            for (const call of toolCalls) {
+              const client = mcpClients.find((c) => call.name.startsWith(`${c.name}__`));
+              if (!client) {
+                chat.push({ role: "tool", tool_call_id: call.id, content: `Unknown tool namespace: ${call.name}` });
+                continue;
+              }
+              try {
+                const result = (await client.client.request("tools/call", {
+                  name: call.name.slice(client.name.length + 2),
+                  arguments: call.arguments,
+                })) as { content?: Array<{ type: string; text?: string }> };
+                const payload = (result.content ?? [])
+                  .map((part) => (part.type === "text" ? part.text : `[${part.type}]`))
+                  .join("\n");
+                chat.push({ role: "tool", tool_call_id: call.id, content: payload || "(no content)" });
+              } catch (error) {
+                chat.push({
+                  role: "tool",
+                  tool_call_id: call.id,
+                  content: error instanceof Error ? error.message : String(error),
+                });
+              }
+            }
+          }
+
           appendNative(threadId, {
             dir: "in",
             source: "openai-compat.chat.completions",
-            msg: { textLength: text.length, reasoningLength: reasoning.length, usage },
+            msg: { textLength: finalText.length, reasoningLength: finalReasoning.length, usage: totalUsage },
           });
-          const replyText = text.trim() ? text : reasoning;
+          const replyText = finalText.trim()
+            ? finalText
+            : finalReasoning.trim()
+              ? finalReasoning
+              : "(no content)";
           if (replyText.trim()) {
             emit({
               ...base(threadId, turnId),
@@ -348,13 +588,14 @@ export const OpenAICompatDriver: ProviderDriver<OpenAICompatConfig> = {
               text: replyText,
             });
           }
-          if (usage) {
+          if (totalUsage) {
             emit({
               ...base(threadId, turnId),
               type: "thread.token-usage.updated",
-              ...usage,
+              ...totalUsage,
             });
           }
+          await Promise.allSettled(mcpClients.map((c) => c.client.stop()));
           active.delete(threadId);
           emit({
             ...base(threadId, turnId),
@@ -362,7 +603,7 @@ export const OpenAICompatDriver: ProviderDriver<OpenAICompatConfig> = {
             ok: true,
             stopReason: null,
             cost: null,
-            ...(usage ? { usage } : {}),
+            ...(totalUsage ? { usage: totalUsage } : {}),
           });
         } catch (e) {
           active.delete(threadId);
@@ -409,7 +650,18 @@ export const OpenAICompatDriver: ProviderDriver<OpenAICompatConfig> = {
       snapshot,
       adapter: {
         provider: DRIVER_KIND,
-        capabilities: { sessionModelSwitch: "in-session" },
+        capabilities: {
+          sessionModelSwitch: "in-session",
+          // The driver implements browser (and agents) tools natively over
+          // chat-completions function calling — the reason this driver
+          // exists: non-OpenAI models get real function tools without the
+          // codex namespace representation. computer/localComputer ride the
+          // same MCP stdio mounting (cua-driver / Local VM proxies).
+          browserMcp: true,
+          agentsMcp: true,
+          computerMcp: true,
+          localComputerMcp: true,
+        },
         sendTurn,
         interruptTurn: async (threadId) => active.get(threadId)?.abort.abort(),
         respondToRequest: async () => "unavailable" as const,
