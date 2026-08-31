@@ -552,10 +552,25 @@ export const OpenAICompatDriver: ProviderDriver<OpenAICompatConfig> = {
                 continue;
               }
               try {
-                const result = (await client.client.request("tools/call", {
-                  name: call.name.slice(client.name.length + 2),
-                  arguments: call.arguments,
-                })) as { content?: Array<{ type: string; text?: string }> };
+                // One cold-start retry: the first MCP round trip of a fresh
+                // client pair can time out while the CLI process spins up
+                // (observed with the real-chrome bridge on a cold turn). The
+                // second attempt lands on a warm process, which is why the
+                // retry lives here and not at the transport layer.
+                let result: { content?: Array<{ type: string; text?: string }> };
+                try {
+                  result = (await client.client.request("tools/call", {
+                    name: call.name.slice(client.name.length + 2),
+                    arguments: call.arguments,
+                  })) as { content?: Array<{ type: string; text?: string }> };
+                } catch (firstError) {
+                  const message = firstError instanceof Error ? firstError.message : String(firstError);
+                  if (!/timed out/i.test(message)) throw firstError;
+                  result = (await client.client.request("tools/call", {
+                    name: call.name.slice(client.name.length + 2),
+                    arguments: call.arguments,
+                  })) as { content?: Array<{ type: string; text?: string }> };
+                }
                 const payload = (result.content ?? [])
                   .map((part) => (part.type === "text" ? part.text : `[${part.type}]`))
                   .join("\n");
