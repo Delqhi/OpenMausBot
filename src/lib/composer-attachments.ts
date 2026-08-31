@@ -271,7 +271,7 @@ export function splitTranscriptAttachments(text: string): TranscriptAttachments 
   const images: string[] = [];
   const files: TranscriptFileAttachment[] = [];
   const display = text.replace(
-    /<attached-(image|file)\b((?:\s+[A-Za-z_:][\w:.-]*="[^"]*")*)\s*\/?>(?:[ \t]*\r?\n)?/g,
+    /^[\t ]*<attached-(image|file)\b((?:[\t ]+[A-Za-z_:][\w:.-]*="[^"\r\n]*")*)[\t ]*\/>[\t ]*(?:\r?\n)?/gm,
     (match, kind: "image" | "file", rawAttributes: string) => {
       const attributes = new Map<string, string>();
       for (const attribute of rawAttributes.matchAll(/\s+([A-Za-z_:][\w:.-]*)="([^"]*)"/g)) {

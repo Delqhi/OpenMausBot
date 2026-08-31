@@ -19,8 +19,8 @@ To review the primary flow:
 6. In Safari, Notes, Photos, or Files, open the system Share sheet and choose
    **OpenMausBot**. The extension shows the paired computer and asks for a bot
    or room before sending the selected link, text, image, or document. The
-   containing app does not need to be open, but the paired computer must be on
-   and OpenMausBot must be running.
+   containing app does not need to be open, but the paired computer must remain
+   awake with OpenMausBot running.
 
 To review optional cross-network HTTPS access, enter an email in **Settings →
 Phone → Use your phone anywhere** on the desktop, enter the eight-digit

@@ -40,9 +40,10 @@ account. A user may separately sign in on the desktop to enable the optional
   permissions. Individual images are limited to 10 MiB, documents to 25 MiB,
   and the computer refuses new uploads after 512 MiB of attachments rather than
   silently deleting files referenced by older conversations. Temporary iPhone
-  copies are removed after a completed send or
-  cancellation. If iOS terminates the extension mid-transfer, the next Share
-  sheet session or OpenMausMobile foreground launch removes the abandoned copy.
+  copies are removed after a completed send or cancellation. If iOS terminates
+  the extension mid-transfer, the next Share sheet session removes the abandoned
+  copy immediately; an OpenMausMobile foreground launch removes it once it is at
+  least 60 minutes old.
 - The app contains no advertising or analytics SDKs, does not track users
   across other companies' apps or websites, and does not sell personal data.
 

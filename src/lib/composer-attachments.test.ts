@@ -115,6 +115,13 @@ describe("splitTranscriptAttachments", () => {
     expect(splitTranscriptAttachments(stored)).toEqual({ display: stored, images: [], files: [] });
   });
 
+  it("leaves inline and non-self-closing attachment examples visible", () => {
+    const stored =
+      'Example: <attached-file path="/tmp/inline.pdf" />\n' +
+      '<attached-image path="/tmp/not-self-closing.png">';
+    expect(splitTranscriptAttachments(stored)).toEqual({ display: stored, images: [], files: [] });
+  });
+
   it("leaves plain text and other tags untouched", () => {
     const stored = '<pasted-text index="1">\nhi\n</pasted-text>';
     const { display, images, files } = splitTranscriptAttachments(stored);
