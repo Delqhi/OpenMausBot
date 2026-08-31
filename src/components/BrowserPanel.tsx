@@ -9,7 +9,7 @@ import { ArrowLeft, ExternalLink, Globe, Hand, Loader2, Maximize2, Minimize2, Pl
 import { usePageVisible } from "@/lib/page-visible";
 import { cn } from "@/lib/cn";
 import { transitionBrowserControlLease } from "@/lib/computer-control";
-import { useStore, type Bot, type BotAnnouncement, type BrowserProfile } from "@/state/store";
+import { api, useStore, type Bot, type BotAnnouncement, type BrowserProfile } from "@/state/store";
 import { browserProfilePartitionId, browserProfilesForPatch } from "@/lib/browser-profiles";
 
 type ControlSnapshot = { held: boolean; helpReason: string | null };
@@ -20,13 +20,6 @@ const GUEST_PROFILE = "guest";
 // Deliberately outside the server's profile-id alphabet so no legacy or API
 // profile can collide with this select-only action.
 const NEW_PROFILE = ":new-profile";
-
-async function api(path: string, init?: RequestInit): Promise<any> {
-  const res = await fetch(path, { headers: { "content-type": "application/json" }, ...init });
-  const body = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(body.error ?? `${res.status} ${res.statusText}`);
-  return body;
-}
 
 function elementBounds(element: HTMLElement | null): DesktopWorkspaceBounds | null {
   const rect = element?.getBoundingClientRect();
