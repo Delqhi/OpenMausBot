@@ -190,6 +190,7 @@ import { loadBundledSkills, loadUserSkills, mergeSkills, renderSkillInstructions
 import { installedPlaybookInstructions } from "./installed-playbooks.ts";
 import { createBotPackageExport } from "./package-export.ts";
 import { shouldMountLocalComputer } from "./local-routing.ts";
+import { chromeWindowChoreography } from "./real-chrome-window.ts";
 import {
   PendingTurnCancellations,
   RetiredTurnRegistry,
@@ -7304,6 +7305,11 @@ const server = createServer(async (req, res) => {
         const controlLeaseId = leaseResult?.data;
         if (action === "take" && controlLeaseId) {
           const result = computerControl.acquireLease(bot.id, controlLeaseId);
+          // Real-chrome window choreography: the person wants the keyboard —
+          // bring this bot's own Chrome frontmost and full-size.
+          if (process.env.OPENMAUSBOT_REAL_CHROME === "1") {
+            void chromeWindowChoreography(bot.id, "take");
+          }
           return json(res, 200, {
             ...result.snapshot,
             owned: result.owned,
@@ -7312,10 +7318,25 @@ const server = createServer(async (req, res) => {
         }
         if (action === "release" && controlLeaseId) {
           const result = computerControl.releaseLease(bot.id, controlLeaseId);
+          if (process.env.OPENMAUSBOT_REAL_CHROME === "1") {
+            void chromeWindowChoreography(bot.id, "release");
+          }
           return json(res, 200, { ...result.snapshot, released: result.released });
         }
-        if (action === "take") return json(res, 200, computerControl.take(bot.id));
-        if (action === "release") return json(res, 200, computerControl.release(bot.id));
+        if (action === "take") {
+          const snapshot = computerControl.take(bot.id);
+          if (process.env.OPENMAUSBOT_REAL_CHROME === "1" && snapshot.held) {
+            void chromeWindowChoreography(bot.id, "take");
+          }
+          return json(res, 200, snapshot);
+        }
+        if (action === "release") {
+          const snapshot = computerControl.release(bot.id);
+          if (process.env.OPENMAUSBOT_REAL_CHROME === "1" && !snapshot.held) {
+            void chromeWindowChoreography(bot.id, "release");
+          }
+          return json(res, 200, snapshot);
+        }
         if (action === "dismiss-help") return json(res, 200, computerControl.dismissHelp(bot.id));
         return json(res, 400, { error: "action must be take, release, or dismiss-help" });
       }
