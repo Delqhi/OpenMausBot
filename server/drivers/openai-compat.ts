@@ -17,7 +17,13 @@ import type {
   RuntimeEventListener,
   SendTurnInput,
 } from "../contracts.ts";
+import { execFile } from "node:child_process";
+import { readFile, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { promisify } from "node:util";
 import { newEventId, newId } from "../contracts.ts";
+const execFileP = promisify(execFile);
 import { appendNative } from "./native.ts";
 
 const DRIVER_KIND = "openai-compat";
@@ -583,14 +589,39 @@ export const OpenAICompatDriver: ProviderDriver<OpenAICompatConfig> = {
                   (part): part is { type: "image"; data: string; mimeType: string } => (part as any).type === "image",
                 );
                 if (images.length) {
+                  // deepseek-v4-flash-vision-exp rejects PNG data URLs
+                  // ("unsupported image") while accepting JPEG; transcode
+                  // per-model so every B.AI vision model works unchanged.
+                  const wantsJpeg = /deepseek.*vision/i.test(turn.model ?? "");
+                  let imageParts: Array<{ type: "image_url"; image_url: { url: string } }> = [];
+                  if (wantsJpeg) {
+                    for (const image of images) {
+                      try {
+                        const png = join(tmpdir(), `omb-shot-${newId()}.png`);
+                        const jpg = `${png}.jpg`;
+                        await writeFile(png, Buffer.from(image.data, "base64"));
+                        await execFileP("sips", ["-s", "format", "jpeg", "-s", "formatOptions", "80", png, "--out", jpg]);
+                        imageParts.push({
+                          type: "image_url",
+                          image_url: { url: `data:image/jpeg;base64,${(await readFile(jpg)).toString("base64")}` },
+                        });
+                        await rm(png, { force: true });
+                        await rm(jpg, { force: true });
+                      } catch {
+                        imageParts.push({ type: "image_url", image_url: { url: `data:${image.mimeType};base64,${image.data}` } });
+                      }
+                    }
+                  } else {
+                    imageParts = images.map((image) => ({
+                      type: "image_url",
+                      image_url: { url: `data:${image.mimeType};base64,${image.data}` },
+                    }));
+                  }
                   chat.push({
                     role: "user",
                     content: [
                       { type: "text", text: "Der aktuelle Screenshot des Browser-Tools:" },
-                      ...images.map((image) => ({
-                        type: "image_url",
-                        image_url: { url: `data:${image.mimeType};base64,${image.data}` },
-                      })),
+                      ...imageParts,
                     ],
                   });
                 }
