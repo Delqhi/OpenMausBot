@@ -101,6 +101,12 @@ export const TOOLS = [
     description: "The current page's title and address, without elements. Cheap; use it to confirm where you are.",
     inputSchema: { type: "object", properties: {} },
   },
+  {
+    name: "browser_screenshot",
+    description:
+      "See the current page as an image. Use when the accessibility tree is not enough (layout, charts, visual state, video pages). The image is returned alongside a short text header.",
+    inputSchema: { type: "object", properties: {} },
+  },
 ] as const;
 
 type ToolContent = { type: "text"; text: string };
@@ -114,15 +120,32 @@ function textResult(text: string, isError = false): ToolResult {
 
 /** One round trip to the agent-computer API. Errors carry the backend's own
  * sentence — that text is exactly what the model should read. */
-async function ac(operation: "navigate" | "snapshot" | "read" | "click" | "type" | "key" | "scroll", body: object = {}): Promise<unknown> {
+async function ac(
+  operation: "navigate" | "snapshot" | "read" | "click" | "type" | "key" | "scroll" | "screenshot",
+  body: object = {},
+): Promise<unknown> {
   if (!BASE || !TOKEN || !BOT) throw new Error("the real-chrome backend is not connected for this bot (OMB_AC_* unset)");
-  const res = await fetch(`${BASE}${operation}`, {
-    method: operation === "snapshot" || operation === "read" ? "POST" : "POST",
-    headers: { "x-openbot-computer-token": TOKEN, "x-openbot-bot-id": BOT, "content-type": "application/json" },
-    body: JSON.stringify(body),
-    signal: AbortSignal.timeout(operation === "navigate" ? 45_000 : 20_000),
-  });
+  // Operations arrive WITH their leading slash — compare against the
+  // slashed forms or every GET silently degrades to POST (404).
+  const isShot = operation === "/screenshot";
+  const isGet = isShot || operation === "/read";
+  // The screenshot handler wraps capture in an 8 s server-side cap and a
+  // cold renderer can exceed one cycle; retries inside the bridge are much
+  // cheaper than a failed model turn.
+  const attempt = async (): Promise<unknown> =>
+    fetch(`${BASE}${operation}`, {
+      method: isGet ? "GET" : "POST",
+      headers: isGet
+        ? { "x-openbot-computer-token": TOKEN, "x-openbot-bot-id": BOT }
+        : { "x-openbot-computer-token": TOKEN, "x-openbot-bot-id": BOT, "content-type": "application/json" },
+      ...(isGet ? {} : { body: JSON.stringify(body) }),
+      signal: AbortSignal.timeout(operation === "navigate" ? 45_000 : isShot ? 12_000 : 20_000),
+    });
+  const res = isShot
+    ? await attempt().catch(() => attempt())
+    : await attempt();
   const parsed: unknown = await res.json().catch(() => ({}));
+  if (process.env.OMB_DEBUG === "1") console.error(`[bridge] ${operation} url=${new URL(`${BASE}${operation}`).href} res.url=${res.url} -> ${res.status}`);
   if (!res.ok) {
     const message = (parsed as { error?: string }).error ?? `agent-computer: HTTP ${res.status}`;
     throw new Error(message);
@@ -203,6 +226,18 @@ async function callTool(name: string, args: Record<string, unknown>): Promise<To
   if (name === "browser_state") {
     const page = (await ac("/read")) as { url?: string; title?: string };
     return textResult(`${page.title || "Untitled"}: ${page.url}`);
+  }
+  if (name === "browser_screenshot") {
+    // Image result for vision models: the harness forwards image parts to
+    // the model as image content; text-only models see the header instead.
+    const shot = (await ac("/screenshot")) as { base64?: string; width?: number; height?: number; url?: string; title?: string };
+    if (!shot.base64) return textResult("Screenshot failed: no image data.", true);
+    return {
+      content: [
+        { type: "text", text: `${shot.title || "Untitled"}: ${shot.url} (${shot.width}x${shot.height} PNG)` },
+        { type: "image", data: shot.base64, mimeType: "image/png" },
+      ],
+    };
   }
   return textResult(`Unknown tool: ${name}`, true);
 }

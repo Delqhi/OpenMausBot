@@ -575,6 +575,25 @@ export const OpenAICompatDriver: ProviderDriver<OpenAICompatConfig> = {
                   .map((part) => (part.type === "text" ? part.text : `[${part.type}]`))
                   .join("\n");
                 chat.push({ role: "tool", tool_call_id: call.id, content: payload || "(no content)" });
+                // Vision passthrough: images inside a tool result ride as a
+                // follow-up user message with image_url parts (the OpenAI
+                // tool role itself cannot carry images; every vision model
+                // reads this pattern natively).
+                const images = (result.content ?? []).filter(
+                  (part): part is { type: "image"; data: string; mimeType: string } => (part as any).type === "image",
+                );
+                if (images.length) {
+                  chat.push({
+                    role: "user",
+                    content: [
+                      { type: "text", text: "Der aktuelle Screenshot des Browser-Tools:" },
+                      ...images.map((image) => ({
+                        type: "image_url",
+                        image_url: { url: `data:${image.mimeType};base64,${image.data}` },
+                      })),
+                    ],
+                  });
+                }
               } catch (error) {
                 chat.push({
                   role: "tool",
