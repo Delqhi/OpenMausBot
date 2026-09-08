@@ -46,6 +46,7 @@ describe("DshDriver", () => {
 
   afterEach(() => {
     vi.unstubAllGlobals();
+    vi.unstubAllEnvs();
     vi.restoreAllMocks();
   });
 
@@ -62,6 +63,8 @@ describe("DshDriver", () => {
     expect(DshDriver.defaultConfig()).toEqual({ url: "http://127.0.0.1:3080" });
     expect(() => DshDriver.decodeConfig({ url: "https://example.com" })).toThrow(/loopback/i);
     expect(DshDriver.decodeConfig({ url: "http://localhost:3081/" })).toEqual({ url: "http://localhost:3081" });
+    vi.stubEnv("OPENMAUSBOT_DSH_BROWSER", "9c4eeb57");
+    expect(DshDriver.defaultConfig()).toEqual({ url: "http://127.0.0.1:3080", browser: "9c4eeb57" });
   });
 
   it("keeps one DSH session per OpenMausBot thread and returns the final assistant message", async () => {
@@ -128,6 +131,43 @@ describe("DshDriver", () => {
     expect(calls.some((c) => c.method === "session.create")).toBe(false);
     expect(calls.find((c) => c.method === "session.prompt")?.payload.sessionId).toBe("session-1");
 
+    recorder.stop();
+    await inst.dispose();
+  });
+
+  it("injects the configured BrowserSkill browser target into every DSH turn", async () => {
+    const calls: Array<{ method: string; payload: any }> = [];
+    let historyReads = 0;
+    vi.stubGlobal("fetch", vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body ?? "{}"));
+      calls.push({ method: body.method, payload: body.payload });
+      if (body.method === "session.create") return ok(body.rpcId, { sessionId: "session-browser" });
+      if (body.method === "session.prompt") return ok(body.rpcId, { accepted: true });
+      if (body.method === "session.history") {
+        historyReads += 1;
+        return ok(body.rpcId, historyReads === 1
+          ? { events: [], hasMore: false }
+          : { events: [event(1, "turn/end", { turn: 1, reason: { kind: "completed" } })], hasMore: false });
+      }
+      throw new Error(`unexpected ${body.method}`);
+    }));
+
+    const inst = await DshDriver.create({
+      instanceId: "dsh-test",
+      displayName: "DSH",
+      environment: {},
+      enabled: true,
+      config: { url: "http://127.0.0.1:3080", browser: "9c4eeb57" } as any,
+    });
+    const recorder = recordEvents(inst.adapter);
+    await inst.adapter.sendTurn({ threadId: "thread-browser", text: "use the browser" });
+    await recorder.until((e) => e.type === "turn.completed");
+
+    const prompt = calls.find((call) => call.method === "session.prompt")?.payload?.content?.[0]?.text ?? "";
+    expect(prompt).toContain('browser_session action "start"');
+    expect(prompt).toContain('browser: "9c4eeb57"');
+    expect(prompt).toContain("Do not guess another browser id or label");
+    expect(prompt).toContain("use the browser");
     recorder.stop();
     await inst.dispose();
   });

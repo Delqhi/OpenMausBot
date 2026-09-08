@@ -18,6 +18,7 @@ const POLL_MS = 100;
 export interface DshConfig {
   url: string;
   agentPreset?: string;
+  browser?: string;
 }
 
 const MODELS: ModelCatalog = {
@@ -32,11 +33,16 @@ function decodeConfig(raw: unknown): DshConfig {
   if (url.protocol !== "http:" || !["127.0.0.1", "localhost", "::1", "[::1]"].includes(url.hostname)) {
     throw new Error("DSH endpoint must be a loopback HTTP URL");
   }
+  const browser = typeof value.browser === "string" ? value.browser.trim() : "";
+  if (browser && (browser.length > 128 || /[\r\n\0]/.test(browser))) {
+    throw new Error("DSH BrowserSkill browser target must be a single-line id or label up to 128 characters");
+  }
   return {
     url: rawUrl.replace(/\/+$/, ""),
     ...(typeof value.agentPreset === "string" && value.agentPreset.trim()
       ? { agentPreset: value.agentPreset.trim() }
       : {}),
+    ...(browser ? { browser } : {}),
   };
 }
 
@@ -113,7 +119,7 @@ export const DshDriver: ProviderDriver<DshConfig> = {
   install: { docsUrl: "https://github.com/deepseek-ai/deepseek-harness" },
   models: MODELS,
   decodeConfig,
-  defaultConfig: () => decodeConfig({}),
+  defaultConfig: () => decodeConfig({ browser: process.env.OPENMAUSBOT_DSH_BROWSER }),
 
   async create(input: DriverCreateInput<DshConfig>): Promise<ProviderInstance> {
     const { instanceId, config } = input;
@@ -161,7 +167,10 @@ export const DshDriver: ProviderDriver<DshConfig> = {
 
       void (async () => {
         try {
-          const prompt = turn.system ? `${turn.system}\n\n${turn.text}` : turn.text;
+          const browserRouting = config.browser
+            ? `OpenMausBot BrowserSkill routing: for every browser_session action "start", pass browser: ${JSON.stringify(config.browser)} unless the user explicitly supplied a different exact BrowserSkill browser id or label. Do not guess another browser id or label.`
+            : "";
+          const prompt = [browserRouting, turn.system, turn.text].filter((part) => Boolean(part?.trim())).join("\n\n");
           await client.call(
             "session.prompt",
             { sessionId, mode: "queue", content: [{ type: "text", text: prompt }] },
