@@ -20,6 +20,24 @@ function event(seq: number, type: string, data: unknown) {
 
 describe("DshDriver", () => {
 
+  it("documents the SIN production browser authority and marks upstream browser tiers non-authoritative", () => {
+    const root = join(dirname(fileURLToPath(import.meta.url)), "..", "..");
+    const fs = require("node:fs");
+    const runtimeDoc = join(root, "docs/dsh-browserskill-runtime.md");
+    expect(fs.existsSync(runtimeDoc)).toBe(true);
+    const current = fs.readFileSync(runtimeDoc, "utf8");
+    expect(current).toContain("DSH -> BrowserSkill");
+    expect(current).toContain("features.browser=false");
+    expect(current).toContain("OPENMAUSBOT_DSH_BROWSER");
+    expect(current).toContain("Node 24");
+    expect(current).toContain("127.0.0.1:3080");
+    const upstreamDoc = fs.readFileSync(join(root, "docs/computer-use-integration.md"), "utf8");
+    expect(upstreamDoc).toContain("SIN PRODUCTION OVERRIDE");
+    expect(upstreamDoc).toContain("docs/dsh-browserskill-runtime.md");
+    const readme = fs.readFileSync(join(root, "README.md"), "utf8");
+    expect(readme).toContain("docs/dsh-browserskill-runtime.md");
+  });
+
   it("retires the custom real-Chrome bridge from the active server", () => {
     const root = join(dirname(fileURLToPath(import.meta.url)), "..", "..");
     const source = require("node:fs").readFileSync(join(root, "server/index.ts"), "utf8");

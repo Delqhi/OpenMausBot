@@ -71,6 +71,11 @@ already have:
   available on macOS and Ubuntu Xorg after explicit opt-in. Ubuntu Wayland host control remains disabled while
   issue #345 is resolved.
 
+
+## SIN DSH + BrowserSkill deployment
+
+This fork includes a built-in loopback-only DSH ProviderDriver for the SIN/OpenSIN production deployment. Browser-capable DSH bots route real logged-in browser work through DSH and Tencent BrowserSkill while OpenMausBot's embedded browser authority is disabled. See [`docs/dsh-browserskill-runtime.md`](docs/dsh-browserskill-runtime.md) for the production runtime, target pin, security boundary, and acceptance gate. The generic upstream computer/browser architecture remains documented separately in `docs/computer-use-integration.md`.
+
 ## Features
 
 <table>

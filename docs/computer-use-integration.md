@@ -1,3 +1,5 @@
+> **SIN PRODUCTION OVERRIDE.** The document below describes OpenMausBot's upstream embedded-browser/computer-use architecture. In the SIN/OpenSIN production deployment, browser-capable DSH bots do **not** use these browser tiers: `features.browser=false`, and the real logged-in browser path is DSH -> BrowserSkill. Use [`docs/dsh-browserskill-runtime.md`](dsh-browserskill-runtime.md) as the operational authority.
+
 # Computer use & browser use in OpenMausBot
 
 Decision doc, 2026-08-12. How bots in OpenMausBot get local computer use and
